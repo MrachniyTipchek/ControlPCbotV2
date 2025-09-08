@@ -35,7 +35,7 @@ def log_command(command, output):
 
 
 def show_notification(command):
-    toaster.show_toast("Telegram Bot Command", f"Executed command:\n{command}", duration=5, threaded=True)
+    toaster.show_toast("ControlPCbotV2", f"Executed command:\n{command}", duration=5, threaded=True)
 
 
 def create_main_menu():
@@ -165,18 +165,14 @@ def list_directory(path):
 
 def enable_autostart():
     try:
-        script_path = os.path.abspath(__file__)
-        bat_path = os.path.join(os.path.dirname(script_path), "start.bat")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        bat_path = os.path.join(script_dir, "start.bat")
 
-        with open(bat_path, "w") as bat_file:
-            bat_file.write(f'@echo off\n')
-            bat_file.write(f'cd /d "{os.path.dirname(script_path)}"\n')
-            bat_file.write(f'python "{script_path}"\n')
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
-        username = getpass.getuser()
-        task_name = "TelegramBotAutoStart"
-        cmd = f'schtasks /create /tn "{task_name}" /tr "{bat_path}" /sc onlogon /ru {username} /f'
-        subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "ControlPCbotV2", 0, winreg.REG_SZ, f'"{bat_path}"')
+
         return True
     except Exception as e:
         print(f"Error enabling autostart: {e}")
@@ -185,14 +181,11 @@ def enable_autostart():
 
 def disable_autostart():
     try:
-        task_name = "TelegramBotAutoStart"
-        cmd = f'schtasks /delete /tn "{task_name}" /f'
-        subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
-        script_path = os.path.abspath(__file__)
-        bat_path = os.path.join(os.path.dirname(script_path), "start.bat")
-        if os.path.exists(bat_path):
-            os.remove(bat_path)
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, "ControlPCbotV2")
+
         return True
     except Exception as e:
         print(f"Error disabling autostart: {e}")
@@ -201,12 +194,21 @@ def disable_autostart():
 
 def check_autostart():
     try:
-        task_name = "TelegramBotAutoStart"
-        cmd = f'schtasks /query /tn "{task_name}"'
-        result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return result.returncode == 0
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+            try:
+                winreg.QueryValueEx(key, "ControlPCbotV2")
+                return True
+            except FileNotFoundError:
+                return False
     except:
         return False
+
+
+def check_system_uptime():
+    uptime_seconds = time.time() - psutil.boot_time()
+    return uptime_seconds < 300
 
 
 @bot.message_handler(func=lambda message: message.chat.id != config.CHAT_ID)
@@ -218,16 +220,20 @@ def handle_unauthorized(message):
 def send_welcome(message):
     if message.chat.id != config.CHAT_ID:
         return
+
+    if check_system_uptime():
+        bot.send_message(message.chat.id, "🖥️ Компьютер был запущен недавно")
+
     help_text = (
-        "🤖 Бот управления компьютером\n\n"
+        "🤖 ControlPCbotV2 - Бот управления компьютером\n\n"
         "Доступные команды:\n"
         "/menu - Главное меню\n"
         "/cmd [команда] - Выполнить команду в CMD\n"
         "/cmdlist - Список полезных CMD команд\n"
         "/kill - Завершить процесс\n"
-        "/log - Получить лог команд\n"
-        "/autostart - Управление автозапуском\n\n"
-        "⚠️ Для выполнения команд требуются права администратора"
+        "/log - Получить лог команд\n\n"
+        "⚠️ Для выполнения команд требуются права администратора\n\n"
+        "Автор: https://github.com/MrachniyTipchek"
     )
     bot.send_message(message.chat.id, help_text, reply_markup=create_main_menu())
 
@@ -236,7 +242,7 @@ def send_welcome(message):
 def show_control_menu(message):
     if message.chat.id != config.CHAT_ID:
         return
-    bot.send_message(message.chat.id, "📱 Главное меню управления:", reply_markup=create_main_menu())
+    bot.send_message(message.chat.id, "📱 Главное меню управления ControlPCbotV2:", reply_markup=create_main_menu())
 
 
 @bot.message_handler(commands=['kill'])
@@ -388,7 +394,8 @@ def handle_control_buttons(call):
     bot.answer_callback_query(call.id)
     action = call.data
     if action == "main_menu":
-        bot.edit_message_text("📱 Главное меню управления:", call.message.chat.id, call.message.message_id,
+        bot.edit_message_text("📱 Главное меню управления ControlPCbotV2:", call.message.chat.id,
+                              call.message.message_id,
                               reply_markup=create_main_menu())
     elif action == "shutdown":
         bot.edit_message_text("⚠️ Вы уверены, что хотите выключить компьютер?", call.message.chat.id,
@@ -480,19 +487,22 @@ def handle_control_buttons(call):
                               reply_markup=create_main_menu())
     elif action == "autostart_menu":
         status = "✅ Включен" if check_autostart() else "❌ Выключен"
-        bot.edit_message_text(f"🚀 Управление автозапуском\n\nТекущий статус: {status}", call.message.chat.id,
+        bot.edit_message_text(f"🚀 Управление автозапуском ControlPCbotV2\n\nТекущий статус: {status}",
+                              call.message.chat.id,
                               call.message.message_id, reply_markup=create_autostart_keyboard())
     elif action == "autostart_enable":
         if enable_autostart():
             bot.answer_callback_query(call.id, "✅ Автозапуск включен")
-            bot.edit_message_text("🚀 Управление автозапуском\n\nТекущий статус: ✅ Включен", call.message.chat.id,
+            bot.edit_message_text("🚀 Управление автозапуском ControlPCbotV2\n\nТекущий статус: ✅ Включен",
+                                  call.message.chat.id,
                                   call.message.message_id, reply_markup=create_autostart_keyboard())
         else:
             bot.answer_callback_query(call.id, "❌ Ошибка включения автозапуска")
     elif action == "autostart_disable":
         if disable_autostart():
             bot.answer_callback_query(call.id, "✅ Автозапуск отключен")
-            bot.edit_message_text("🚀 Управление автозапуском\n\nТекущий статус: ❌ Выключен", call.message.chat.id,
+            bot.edit_message_text("🚀 Управление автозапуском ControlPCbotV2\n\nТекущий статус: ❌ Выключен",
+                                  call.message.chat.id,
                                   call.message.message_id, reply_markup=create_autostart_keyboard())
         else:
             bot.answer_callback_query(call.id, "❌ Ошибка отключения автозапуска")
@@ -515,7 +525,8 @@ def handle_control_buttons(call):
         )
         bot.send_message(call.message.chat.id, cmd_help, parse_mode="Markdown")
     elif action == "exit":
-        bot.edit_message_text("👋 Бот завершает работу. Для возобновления отправьте /start", call.message.chat.id,
+        bot.edit_message_text("👋 ControlPCbotV2 завершает работу. Для возобновления отправьте /start",
+                              call.message.chat.id,
                               call.message.message_id)
 
 
@@ -525,12 +536,20 @@ if __name__ == "__main__":
     if not os.path.exists("command_log.txt"):
         open("command_log.txt", 'w').close()
 
+    if check_system_uptime():
+        try:
+            bot.send_message(config.CHAT_ID,
+                             "🖥️ Компьютер был запущен! ControlPCbotV2 активен\nАвтор: https://github.com/MrachniyTipchek")
+        except Exception as e:
+            print(f"Не удалось отправить уведомление о запуске: {str(e)}")
+
     print("=" * 50)
-    print("Windows Telegram Control Bot")
+    print("ControlPCbotV2 - Windows Telegram Control Bot")
     print("=" * 50)
     print(f"Токен: {config.TOKEN}")
     print(f"Chat ID: {config.CHAT_ID}")
     print(f"Автозапуск: {'✅ Включен' if user_state['autostart_enabled'] else '❌ Выключен'}")
+    print("Автор: https://github.com/MrachniyTipchek")
     print("\nБот запущен. Ожидание сообщений...")
     print("Для остановки нажмите Ctrl+C")
 
