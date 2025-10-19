@@ -29,7 +29,6 @@ ControlPCbotV2 - это телеграм-бот для удаленного уп
 2. Заполнить config.py
 3. Изменить Start.bat
 4. Откройте папку в командной строке и введите следующие команды:
-5. Открыть папку в командной строке и ввести:
 ```
 pip install -r requirements.txt
 python main.py
@@ -63,5 +62,6 @@ python main.py
 ## Лицензия
 
 Проект распространяется под лицензией MIT. Подробнее см. в файле [LICENSE](LICENSE).
+
 
 Автор: https://github.com/MrachniyTipchek
