@@ -27,7 +27,8 @@ user_state = {
     "current_directory": os.path.expanduser("~"),
     "waiting_for_emulation_text": False,
     "waiting_for_process_kill": False,
-    "process_list": []
+    "process_list": [],
+    "file_manager_page": 0
 }
 
 
@@ -48,18 +49,6 @@ def get_drives():
         if 'cdrom' not in drive.opts:
             drives.append(drive.device)
     return drives
-
-
-def get_special_folders():
-    folders = {
-        "Desktop": os.path.join(os.path.expanduser("~"), "Desktop"),
-        "Downloads": os.path.join(os.path.expanduser("~"), "Downloads"),
-        "Documents": os.path.join(os.path.expanduser("~"), "Documents"),
-        "Pictures": os.path.join(os.path.expanduser("~"), "Pictures"),
-        "Music": os.path.join(os.path.expanduser("~"), "Music"),
-        "Videos": os.path.join(os.path.expanduser("~"), "Videos")
-    }
-    return folders
 
 
 def create_main_menu():
@@ -87,10 +76,6 @@ def create_file_manager_keyboard(current_path=None):
     if current_path is None:
         current_path = user_state["current_directory"]
 
-    folders = get_special_folders()
-    for name, path in folders.items():
-        keyboard.add(InlineKeyboardButton(f"📁 {name}", callback_data=f"folder_{path}"))
-
     drives = get_drives()
     for drive in drives:
         keyboard.add(InlineKeyboardButton(f"💾 Диск {drive}", callback_data=f"folder_{drive}"))
@@ -105,10 +90,19 @@ def create_file_manager_keyboard(current_path=None):
 
 def create_directory_keyboard(path):
     keyboard = InlineKeyboardMarkup()
+    page = user_state["file_manager_page"]
+    items_per_page = 30
 
     try:
         items = os.listdir(path)
-        for item in items[:10]:
+        total_items = len(items)
+        total_pages = (total_items + items_per_page - 1) // items_per_page
+
+        start_index = page * items_per_page
+        end_index = min((page + 1) * items_per_page, total_items)
+
+        for i in range(start_index, end_index):
+            item = items[i]
             full_path = os.path.join(path, item)
             if os.path.isdir(full_path):
                 keyboard.add(InlineKeyboardButton(f"📁 {item}", callback_data=f"folder_{full_path}"))
@@ -116,9 +110,18 @@ def create_directory_keyboard(path):
                 size = os.path.getsize(full_path) // 1024
                 keyboard.add(InlineKeyboardButton(f"📄 {item} ({size} KB)", callback_data=f"file_{full_path}"))
 
+        navigation_buttons = []
+        if page > 0:
+            navigation_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data="file_manager_prev"))
+        if page < total_pages - 1:
+            navigation_buttons.append(InlineKeyboardButton("Вперед ➡️", callback_data="file_manager_next"))
+
+        if navigation_buttons:
+            keyboard.row(*navigation_buttons)
+
         parent_dir = os.path.dirname(path)
-        if parent_dir and os.path.exists(parent_dir):
-            keyboard.add(InlineKeyboardButton("↩️ Назад", callback_data=f"folder_{parent_dir}"))
+        if parent_dir and os.path.exists(parent_dir) and parent_dir != path:
+            keyboard.add(InlineKeyboardButton("⬆️ Выше", callback_data=f"folder_{parent_dir}"))
 
         keyboard.add(InlineKeyboardButton("📤 Загрузить файл сюда", callback_data="upload_here"))
         keyboard.add(InlineKeyboardButton("📦 Скачать папку архивом", callback_data="archive_folder"))
@@ -613,21 +616,39 @@ def handle_control_buttons(call):
             bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
 
     elif action == "file_manager":
+        user_state["file_manager_page"] = 0
         try:
-            bot.edit_message_text("📁 Управление файлами - выберите папку:", call.message.chat.id,
+            bot.edit_message_text("📁 Управление файлами - выберите диск:", call.message.chat.id,
                                   call.message.message_id, reply_markup=create_file_manager_keyboard())
         except:
             pass
 
     elif action.startswith("folder_"):
         path = action[7:]
-        user_state["current_directory"] = path
-        content = list_directory(path)
         try:
-            bot.edit_message_text(f"📂 Содержимое папки: {path}\n\n{content}", call.message.chat.id,
-                                  call.message.message_id, reply_markup=create_directory_keyboard(path))
-        except:
-            pass
+            if not os.path.exists(path):
+                bot.answer_callback_query(call.id, "❌ Папка не существует")
+                return
+
+            if not os.path.isdir(path):
+                bot.answer_callback_query(call.id, "❌ Это не папка")
+                return
+
+            user_state["current_directory"] = path
+            user_state["file_manager_page"] = 0
+
+            try:
+                items = os.listdir(path)
+                content = f"📂 Содержимое папки: {path}\n\nНайдено элементов: {len(items)}"
+                bot.edit_message_text(content, call.message.chat.id,
+                                      call.message.message_id, reply_markup=create_directory_keyboard(path))
+            except PermissionError:
+                bot.answer_callback_query(call.id, "❌ Нет доступа к папке")
+            except Exception as e:
+                bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
+
+        except Exception as e:
+            bot.answer_callback_query(call.id, f"❌ Ошибка доступа: {str(e)}")
 
     elif action.startswith("file_"):
         file_path = action[5:]
@@ -677,6 +698,29 @@ def handle_control_buttons(call):
         try:
             bot.edit_message_text("⌨️ Введите полный путь к папке:", call.message.chat.id, call.message.message_id)
             user_state["waiting_for_path"] = "enter_folder"
+        except:
+            pass
+
+    elif action == "file_manager_prev":
+        if user_state["file_manager_page"] > 0:
+            user_state["file_manager_page"] -= 1
+        current_dir = user_state["current_directory"]
+        try:
+            items = os.listdir(current_dir)
+            content = f"📂 Содержимое папки: {current_dir}\n\nНайдено элементов: {len(items)}"
+            bot.edit_message_text(content, call.message.chat.id,
+                                  call.message.message_id, reply_markup=create_directory_keyboard(current_dir))
+        except:
+            pass
+
+    elif action == "file_manager_next":
+        user_state["file_manager_page"] += 1
+        current_dir = user_state["current_directory"]
+        try:
+            items = os.listdir(current_dir)
+            content = f"📂 Содержимое папки: {current_dir}\n\nНайдено элементов: {len(items)}"
+            bot.edit_message_text(content, call.message.chat.id,
+                                  call.message.message_id, reply_markup=create_directory_keyboard(current_dir))
         except:
             pass
 
@@ -994,9 +1038,19 @@ def handle_path_input(message):
     elif action == "enter_folder":
         if os.path.exists(path) and os.path.isdir(path):
             user_state["current_directory"] = path
-            content = list_directory(path)
-            bot.reply_to(message, f"📂 Содержимое папки: {path}\n\n{content}",
-                         reply_markup=create_directory_keyboard(path))
+            user_state["file_manager_page"] = 0
+            try:
+                items = os.listdir(path)
+                content = f"📂 Содержимое папки: {path}\n\nНайдено элементов: {len(items)}"
+                bot.reply_to(message, content, reply_markup=create_directory_keyboard(path))
+            except PermissionError:
+                bot.reply_to(message, "❌ Нет доступа к папке")
+                keyboard = create_main_menu()
+                bot.send_message(message.chat.id, "📱 Возврат в главное меню:", reply_markup=keyboard)
+            except Exception as e:
+                bot.reply_to(message, f"❌ Ошибка: {str(e)}")
+                keyboard = create_main_menu()
+                bot.send_message(message.chat.id, "📱 Возврат в главное меню:", reply_markup=keyboard)
         else:
             bot.reply_to(message, "❌ Указанный путь не существует или не является папкой")
             keyboard = create_main_menu()
