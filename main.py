@@ -1,1084 +1,1617 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
+import sys
+import json
 import logging
 import subprocess
 import time
-import telebot
-import psutil
-import pyautogui
+import threading
+import base64
 import tempfile
+import shutil
+import atexit
+import zipfile
+import traceback
+
+import tkinter as tk
+from tkinter import messagebox, filedialog
+
 import winreg
 import ctypes
-import zipfile
+
+import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import psutil
+import pyautogui
 from win10toast import ToastNotifier
-import config
+import pystray
+from PIL import Image, ImageDraw
 
-bot = telebot.TeleBot(config.TOKEN)
-logger = telebot.logger
-logger.setLevel(logging.INFO)
-toaster = ToastNotifier()
-
-user_state = {
-    "process_page": 0,
-    "selected_process": None,
-    "waiting_for_path": None,
-    "upload_path": None,
-    "show_system_processes": False,
-    "current_directory": os.path.expanduser("~"),
-    "waiting_for_emulation_text": False,
-    "waiting_for_process_kill": False,
-    "process_list": [],
-    "file_manager_page": 0
+CONFIG = {
+    "PROCESSES_PER_PAGE": 20,
+    "FILES_PER_PAGE": 20,
+    "SHUTDOWN_DELAY": 60,
+    "CMD_TIMEOUT": 30,
+    "MESSAGE_MAX_LENGTH": 4000,
+    "TELEGRAM_MAX_FILE_SIZE": 2 * 1024 * 1024 * 1024,
+    "CALLBACK_DATA_MAX_LENGTH": 64,
 }
 
+def is_frozen():
+    return getattr(sys, 'frozen', False)
 
-def log_command(command, output):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    with open("command_log.txt", "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] Command: {command}\n")
-        f.write(f"Output: {output}\n\n")
+def get_app_dir():
+    if is_frozen():
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
+def get_data_dir():
+    appdata = os.environ.get('APPDATA', os.path.expanduser('~'))
+    data_dir = os.path.join(appdata, 'ControlPCbotV2')
+    os.makedirs(data_dir, exist_ok=True)
+    return data_dir
 
-def show_notification(command):
-    toaster.show_toast("ControlPCbotV2", f"Executed command:\n{command}", duration=5, threaded=True)
-
-
-def get_drives():
-    drives = []
-    for drive in psutil.disk_partitions():
-        if 'cdrom' not in drive.opts:
-            drives.append(drive.device)
-    return drives
-
-
-def create_main_menu():
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    autostart_status = "✅ Автозапуск" if check_autostart() else "❌ Автозапуск"
-    buttons = [
-        InlineKeyboardButton("🖥️ Выключить ПК", callback_data="shutdown"),
-        InlineKeyboardButton("🔄 Перезагрузить ПК", callback_data="reboot"),
-        InlineKeyboardButton("📸 Скриншот", callback_data="screenshot"),
-        InlineKeyboardButton("📁 Управление файлами", callback_data="file_manager"),
-        InlineKeyboardButton("❌ Завершить процесс", callback_data="kill_menu"),
-        InlineKeyboardButton("🔊 Управление громкостью", callback_data="volume_control"),
-        InlineKeyboardButton("⌨️ Эмуляция клавиш", callback_data="key_emulation"),
-        InlineKeyboardButton("🖱 Эмуляция мыши", callback_data="mouse_emulation"),
-        InlineKeyboardButton("🔒 Блокировка экрана", callback_data="lock_screen"),
-        InlineKeyboardButton(autostart_status, callback_data="autostart")
-    ]
-    keyboard.add(*buttons)
-    return keyboard
-
-
-def create_file_manager_keyboard(current_path=None):
-    keyboard = InlineKeyboardMarkup()
-
-    if current_path is None:
-        current_path = user_state["current_directory"]
-
-    drives = get_drives()
-    for drive in drives:
-        keyboard.add(InlineKeyboardButton(f"💾 Диск {drive}", callback_data=f"folder_{drive}"))
-
-    keyboard.add(InlineKeyboardButton("📤 Загрузить файл сюда", callback_data="upload_here"))
-    keyboard.add(InlineKeyboardButton("📥 Извлечь файл", callback_data="get_file_here"))
-    keyboard.add(InlineKeyboardButton("⌨️ Ввести путь вручную", callback_data="enter_path"))
-    keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu"))
-
-    return keyboard
-
-
-def create_directory_keyboard(path):
-    keyboard = InlineKeyboardMarkup()
-    page = user_state["file_manager_page"]
-    items_per_page = 30
-
+def encode_path(path):
     try:
-        items = os.listdir(path)
-        total_items = len(items)
-        total_pages = (total_items + items_per_page - 1) // items_per_page
+        if not isinstance(path, str) or not path:
+            return ""
+        return base64.b64encode(path.encode("utf-8")).decode("ascii")
+    except Exception:
+        return ""
 
-        start_index = page * items_per_page
-        end_index = min((page + 1) * items_per_page, total_items)
-
-        for i in range(start_index, end_index):
-            item = items[i]
-            full_path = os.path.join(path, item)
-            if os.path.isdir(full_path):
-                keyboard.add(InlineKeyboardButton(f"📁 {item}", callback_data=f"folder_{full_path}"))
-            else:
-                size = os.path.getsize(full_path) // 1024
-                keyboard.add(InlineKeyboardButton(f"📄 {item} ({size} KB)", callback_data=f"file_{full_path}"))
-
-        navigation_buttons = []
-        if page > 0:
-            navigation_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data="file_manager_prev"))
-        if page < total_pages - 1:
-            navigation_buttons.append(InlineKeyboardButton("Вперед ➡️", callback_data="file_manager_next"))
-
-        if navigation_buttons:
-            keyboard.row(*navigation_buttons)
-
-        parent_dir = os.path.dirname(path)
-        if parent_dir and os.path.exists(parent_dir) and parent_dir != path:
-            keyboard.add(InlineKeyboardButton("⬆️ Выше", callback_data=f"folder_{parent_dir}"))
-
-        keyboard.add(InlineKeyboardButton("📤 Загрузить файл сюда", callback_data="upload_here"))
-        keyboard.add(InlineKeyboardButton("📦 Скачать папку архивом", callback_data="archive_folder"))
-        keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu"))
-
-    except Exception as e:
-        keyboard.add(InlineKeyboardButton("❌ Ошибка доступа", callback_data="noop"))
-        keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu"))
-
-    return keyboard
-
-
-def create_volume_keyboard():
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("🔇 Mute", callback_data="volume_mute"))
-    keyboard.add(InlineKeyboardButton("🔊 Volume Up", callback_data="volume_up"))
-    keyboard.add(InlineKeyboardButton("🔈 Volume Down", callback_data="volume_down"))
-    keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu"))
-    return keyboard
-
-
-def create_key_emulation_keyboard():
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("Ввести текст", callback_data="emulate_text"))
-    keyboard.add(InlineKeyboardButton("Специальные клавиши", callback_data="special_keys"))
-    keyboard.add(InlineKeyboardButton("Сочетания клавиш", callback_data="key_combinations"))
-    keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu"))
-    return keyboard
-
-
-def create_special_keys_keyboard():
-    keyboard = InlineKeyboardMarkup(row_width=3)
-    keys = [
-        "Win", "Ctrl", "Alt", "Tab", "Enter", "Space",
-        "Up", "Down", "Left", "Right", "Esc", "Delete"
-    ]
-    buttons = [InlineKeyboardButton(key, callback_data=f"key_{key}") for key in keys]
-    keyboard.add(*buttons)
-    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="key_emulation"))
-    return keyboard
-
-
-def create_key_combinations_keyboard():
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    combinations = {
-        "Win+L": "lock",
-        "Alt+Tab": "alt_tab",
-        "Ctrl+C": "ctrl_c",
-        "Ctrl+V": "ctrl_v",
-        "Ctrl+Z": "ctrl_z",
-        "Ctrl+A": "ctrl_a",
-        "Ctrl+S": "ctrl_s",
-        "Win+E": "win_e",
-        "Win+R": "win_r",
-        "Win+D": "win_d",
-        "Ctrl+Shift+Esc": "ctrl_shift_esc",
-        "Alt+F4": "alt_f4"
-    }
-    buttons = []
-    for name, data in combinations.items():
-        buttons.append(InlineKeyboardButton(name, callback_data=f"comb_{data}"))
-    keyboard.add(*buttons)
-    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="key_emulation"))
-    return keyboard
-
-
-def create_mouse_emulation_keyboard():
-    keyboard = InlineKeyboardMarkup(row_width=3)
-
-    keyboard.add(
-        InlineKeyboardButton(" ", callback_data="noop"),
-        InlineKeyboardButton("⬆️", callback_data="mouse_up"),
-        InlineKeyboardButton(" ", callback_data="noop")
-    )
-
-    keyboard.add(
-        InlineKeyboardButton("⬅️", callback_data="mouse_left"),
-        InlineKeyboardButton("🖱", callback_data="noop"),
-        InlineKeyboardButton("➡️", callback_data="mouse_right")
-    )
-
-    keyboard.add(
-        InlineKeyboardButton(" ", callback_data="noop"),
-        InlineKeyboardButton("⬇️", callback_data="mouse_down"),
-        InlineKeyboardButton(" ", callback_data="noop")
-    )
-
-    keyboard.add(
-        InlineKeyboardButton("ЛКМ", callback_data="mouse_left_click"),
-        InlineKeyboardButton("ПКМ", callback_data="mouse_right_click"),
-        InlineKeyboardButton("СКМ", callback_data="mouse_middle_click")
-    )
-
-    keyboard.add(
-        InlineKeyboardButton("Скролл ▲", callback_data="mouse_scroll_up"),
-        InlineKeyboardButton("Скролл ▼", callback_data="mouse_scroll_down")
-    )
-
-    keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu"))
-    return keyboard
-
-
-def create_process_list_message():
-    processes = []
-    for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
-        try:
-            if not user_state["show_system_processes"] and proc.pid < 1000:
-                continue
-            processes.append(proc)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-
-    if not processes:
-        return "❌ Процессы не найдены", []
-
-    processes.sort(key=lambda x: x.info['memory_info'].rss if x.info['memory_info'] else 0, reverse=True)
-
-    result = "📋 Список процессов:\n\n"
-    process_list = []
-
-    for i, proc in enumerate(processes[:20], 1):
-        try:
-            memory_mb = proc.info['memory_info'].rss // 1024 // 1024 if proc.info['memory_info'] else 0
-            result += f"{i}. {proc.info['name']} (PID: {proc.pid}) - {memory_mb} MB\n"
-            process_list.append(proc.pid)
-        except:
-            continue
-
-    result += f"\n📊 Всего процессов: {len(process_list)}"
-    result += "\n\n💡 Введите номер процесса для завершения:"
-
-    return result, process_list
-
-
-def create_zip_archive(folder_path, zip_path):
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for root, dirs, files in os.walk(folder_path):
-            for file in files:
-                file_path = os.path.join(root, file)
-                arcname = os.path.relpath(file_path, folder_path)
-                zipf.write(file_path, arcname)
-
-
-def enable_autostart():
+def decode_path(encoded):
     try:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        bat_path = os.path.join(script_dir, "start.bat")
+        if not isinstance(encoded, str) or not encoded:
+            return ""
+        return base64.b64decode(encoded.encode("ascii")).decode("utf-8")
+    except Exception:
+        return ""
 
-        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
-            winreg.SetValueEx(key, "ControlPCbotV2", 0, winreg.REG_SZ, f'"{bat_path}"')
-
-        return True
-    except Exception as e:
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
         return False
 
-
-def disable_autostart():
-    try:
-        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
-            winreg.DeleteValue(key, "ControlPCbotV2")
-
-        return True
-    except Exception as e:
+def run_as_admin():
+    if is_admin():
         return False
-
-
-def check_autostart():
     try:
-        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
-            try:
-                winreg.QueryValueEx(key, "ControlPCbotV2")
-                return True
-            except FileNotFoundError:
-                return False
-    except:
-        return False
-
-
-def toggle_autostart():
-    if check_autostart():
-        return disable_autostart()
-    else:
-        return enable_autostart()
-
-
-def check_system_uptime():
-    uptime_seconds = time.time() - psutil.boot_time()
-    return uptime_seconds < 300
-
-
-def take_screenshot():
-    try:
-        screenshot = pyautogui.screenshot()
-        temp_file = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-        screenshot.save(temp_file.name, 'PNG')
-        return temp_file.name
-    except Exception as e:
-        return None
-
-
-def list_directory(path):
-    try:
-        if not os.path.exists(path):
-            return "❌ Путь не существует"
-        if not os.path.isdir(path):
-            return "❌ Указанный путь не является папкой"
-        result = "📂 Содержимое папки:\n\n"
-        for item in os.listdir(path):
-            full_path = os.path.join(path, item)
-            if os.path.isdir(full_path):
-                result += f"📁 {item}/\n"
-            else:
-                size = os.path.getsize(full_path)
-                result += f"📄 {item} ({size // 1024} KB)\n"
-        return result
-    except Exception as e:
-        return f"❌ Ошибка: {str(e)}"
-
-
-@bot.message_handler(func=lambda message: message.chat.id != config.CHAT_ID)
-def handle_unauthorized(message):
-    bot.reply_to(message, "⛔ Доступ запрещен")
-
-
-@bot.message_handler(commands=['start', 'help', 'menu'])
-def send_welcome(message):
-    if message.chat.id != config.CHAT_ID:
-        return
-
-    if check_system_uptime():
-        bot.send_message(message.chat.id, "🖥️ Компьютер был запущен недавно")
-
-    help_text = (
-        "🤖 ControlPCbotV2 - Бот управления компьютером\n\n"
-        "Доступные команды:\n"
-        "/menu - Главное меню\n"
-        "/cmd [команда] - Выполнить команду в CMD\n\n"
-        "⚠️ Для выполнения команд требуются права администратора\n\n"
-        "Автор: https://github.com/MrachniyTipchek"
-    )
-    keyboard = create_main_menu()
-    bot.send_message(message.chat.id, help_text, reply_markup=keyboard)
-
-
-@bot.message_handler(commands=['control'])
-def show_control_menu(message):
-    if message.chat.id != config.CHAT_ID:
-        return
-    keyboard = create_main_menu()
-    bot.send_message(message.chat.id, "📱 Главное меню управления ControlPCbotV2:", reply_markup=keyboard)
-
-
-@bot.message_handler(commands=['log'])
-def send_log(message):
-    if message.chat.id != config.CHAT_ID:
-        return
-    try:
-        with open("command_log.txt", "rb") as f:
-            bot.send_document(message.chat.id, f, caption="📝 Лог команд")
-    except Exception as e:
-        bot.reply_to(message, f"⚠️ Ошибка: {str(e)}")
-
-
-@bot.message_handler(commands=['cmd'])
-def handle_cmd_command(message):
-    if message.chat.id != config.CHAT_ID:
-        return
-    command = message.text.replace('/cmd', '', 1).strip()
-    if not command:
-        bot.reply_to(message, "ℹ️ Использование: /cmd [команда]")
-        return
-    show_notification(f"CMD: {command}")
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30,
-            encoding='cp866',
-            cwd=os.path.expanduser("~")
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, " ".join(sys.argv), None, 1
         )
-        output = result.stdout or result.stderr or "Команда выполнена"
-        log_command(command, output)
+        return rc > 32
+    except Exception:
+        return False
 
-        if len(output) > 4000:
-            with open("output.txt", "w", encoding="utf-8") as f:
-                f.write(output)
-            with open("output.txt", "rb") as f:
-                bot.send_document(message.chat.id, f)
-            os.remove("output.txt")
-        else:
-            bot.reply_to(message, f"```\n{output}\n```", parse_mode="Markdown")
-    except Exception as e:
-        log_command(command, f"Error: {str(e)}")
-        bot.reply_to(message, f"⚠️ Ошибка: {str(e)}")
+def get_temp_file(prefix="", suffix=""):
+    temp_dir = tempfile.gettempdir()
+    filename = f"{prefix}{int(time.time() * 1000)}{suffix}"
+    return os.path.join(temp_dir, filename)
 
+def format_size(size):
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024.0:
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} PB"
 
-@bot.message_handler(commands=['cmdlist'])
-def cmd_list(message):
-    if message.chat.id != config.CHAT_ID:
-        return
-
-    cmd_help = (
-        "📋 Основные CMD команды:\n\n"
-        "• `cd` - Сменить директорию\n"
-        "• `dir` - Показать содержимое папки\n"
-        "• `ipconfig` - Информация о сетевых подключениях\n"
-        "• `ping` - Проверить доступность хоста\n"
-        "• `shutdown /s /t 0` - Немедленное выключение\n"
-        "• `shutdown /r /t 0` - Немедленная перезагрузка\n"
-        "• `tasklist` - Список процессов\n"
-        "• `taskkill /F /PID <pid>` - Завершить процесс\n"
-        "• `systeminfo` - Информация о системе\n"
-        "• `curl` - Загрузка файлов из интернета\n\n"
-        "Для выполнения команд используйте /cmd [команда]"
-    )
-    bot.send_message(message.chat.id, cmd_help, parse_mode="Markdown")
-
-
-@bot.message_handler(commands=['autorun'])
-def handle_autorun(message):
-    if message.chat.id != config.CHAT_ID:
-        return
-
-    try:
-        if toggle_autostart():
-            status = "добавлен в автозагрузку" if check_autostart() else "удален из автозагрузки"
-            bot.reply_to(message, f"✅ Бот {status}")
-            log_command("Autorun", f"Toggled, now: {status}")
-        else:
-            bot.reply_to(message, "❌ Ошибка управления автозагрузкой")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка управления автозагрузкой: {str(e)}")
-
-
-@bot.message_handler(
-    func=lambda message: user_state.get("waiting_for_emulation_text") and message.chat.id == config.CHAT_ID)
-def handle_emulation_text(message):
-    user_state["waiting_for_emulation_text"] = False
-    text = message.text
-    try:
-        pyautogui.write(text)
-        bot.reply_to(message, f"✅ Текст введен: '{text}'")
-        log_command("Text Emulation", f"Text: {text}")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка ввода текста: {str(e)}")
-
-    keyboard = create_main_menu()
-    bot.send_message(message.chat.id, "📱 Возврат в главное меню:", reply_markup=keyboard)
-
-
-@bot.message_handler(
-    func=lambda message: user_state.get("waiting_for_process_kill") and message.chat.id == config.CHAT_ID)
-def handle_process_kill_input(message):
-    user_state["waiting_for_process_kill"] = False
-    process_number = message.text.strip()
-
-    try:
-        index = int(process_number) - 1
-        if 0 <= index < len(user_state["process_list"]):
-            pid = user_state["process_list"][index]
+class InstallerWindow:
+    def __init__(self):
+        self.result = None
+        self.root = None
+        self._create_window()
+    
+    def _create_window(self):
+        self.root = tk.Tk()
+        self.root.title("ControlPCbotV2 - Установка")
+        self.root.geometry("540x460")
+        self.root.configure(bg="#1a1a1a")
+        self.root.resizable(False, False)
+        self.root.update_idletasks()
+        x = (self.root.winfo_screenwidth() // 2) - (self.root.winfo_width() // 2)
+        y = (self.root.winfo_screenheight() // 2) - (self.root.winfo_height() // 2)
+        self.root.geometry(f"+{x}+{y}")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._setup_ui()
+    
+    def _setup_ui(self):
+        title_frame = tk.Frame(self.root, bg="#2d2d2d", height=40)
+        title_frame.pack(fill=tk.X)
+        title_frame.pack_propagate(False)
+        title_lbl = tk.Label(title_frame, text="ControlPCbotV2 - Установка",
+                           bg="#2d2d2d", fg="white", font=("Segoe UI", 11))
+        title_lbl.pack(side=tk.LEFT, padx=8, pady=10)
+        close_btn = tk.Button(title_frame, text="✕", command=self._on_close,
+                            bg="#2d2d2d", fg="white", font=("Segoe UI", 14),
+                            relief=tk.FLAT, width=3, height=1,
+                            activebackground="#e81123", cursor="hand2", borderwidth=0)
+        close_btn.pack(side=tk.RIGHT, padx=0, pady=0)
+        close_btn.bind("<Enter>", lambda e: close_btn.config(bg="#e81123"))
+        close_btn.bind("<Leave>", lambda e: close_btn.config(bg="#2d2d2d"))
+        content = tk.Frame(self.root, bg="#1a1a1a")
+        content.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+        default_path = os.path.join(
+            os.environ.get('ProgramFiles', 'C:\\Program Files'),
+            'ControlPCbotV2'
+        )
+        self.add_start = tk.BooleanVar(value=True)
+        self.add_desktop = tk.BooleanVar(value=True)
+        def on_paste(event):
             try:
-                process = psutil.Process(pid)
-                process_name = process.name()
-                process.terminate()
-                bot.reply_to(message, f"✅ Процесс {process_name} (PID: {pid}) завершен")
-                log_command("Kill Process", f"Terminated {process_name} (PID: {pid})")
-            except Exception as e:
-                bot.reply_to(message, f"❌ Ошибка завершения процесса: {str(e)}")
-        else:
-            bot.reply_to(message, "❌ Неверный номер процесса")
-    except ValueError:
-        bot.reply_to(message, "❌ Введите корректный номер")
-
-    keyboard = create_main_menu()
-    bot.send_message(message.chat.id, "📱 Возврат в главное меню:", reply_markup=keyboard)
-
-
-@bot.callback_query_handler(func=lambda call: call.message.chat.id != config.CHAT_ID)
-def handle_unauthorized_callback(call):
-    bot.answer_callback_query(call.id, "⛔ Доступ запрещен")
-
-
-@bot.callback_query_handler(func=lambda call: call.message.chat.id == config.CHAT_ID)
-def handle_control_buttons(call):
-    try:
-        bot.answer_callback_query(call.id)
-    except:
-        pass
-
-    action = call.data
-
-    if action == "main_menu":
-        keyboard = create_main_menu()
-        try:
-            bot.edit_message_text("📱 Главное меню управления ControlPCbotV2:", call.message.chat.id,
-                                  call.message.message_id, reply_markup=keyboard)
-        except:
-            pass
-
-    elif action == "autostart":
-        try:
-            if toggle_autostart():
-                status = "добавлен в автозагрузку" if check_autostart() else "удален из автозагрузки"
-                bot.answer_callback_query(call.id, f"✅ Бот {status}")
-                log_command("Autorun", f"Toggled, now: {status}")
-            else:
-                bot.answer_callback_query(call.id, "❌ Ошибка управления автозагрузкой")
-
-            keyboard = create_main_menu()
-            bot.edit_message_text("📱 Главное меню управления ControlPCbotV2:", call.message.chat.id,
-                                  call.message.message_id, reply_markup=keyboard)
-        except:
-            pass
-
-    elif action == "shutdown":
-        try:
-            keyboard = InlineKeyboardMarkup()
-            keyboard.add(
-                InlineKeyboardButton("✅ Да, завершить", callback_data="shutdown_confirm"),
-                InlineKeyboardButton("❌ Нет, отмена", callback_data="shutdown_cancel")
-            )
-            bot.edit_message_text("⚠️ Вы уверены, что хотите выключить компьютер?", call.message.chat.id,
-                                  call.message.message_id, reply_markup=keyboard)
-        except:
-            pass
-
-    elif action == "shutdown_confirm":
-        try:
-            bot.edit_message_text("✅ Компьютер будет выключен через 1 минуту!", call.message.chat.id,
-                                  call.message.message_id)
-            log_command("System Shutdown", "Initiated by bot")
-            os.system("shutdown /s /t 60")
-        except:
-            pass
-
-    elif action == "shutdown_cancel":
-        keyboard = create_main_menu()
-        try:
-            bot.edit_message_text("❌ Выключение отменено", call.message.chat.id,
-                                  call.message.message_id, reply_markup=keyboard)
-        except:
-            pass
-
-    elif action == "reboot":
-        try:
-            keyboard = InlineKeyboardMarkup()
-            keyboard.add(
-                InlineKeyboardButton("✅ Да, перезагрузить", callback_data="reboot_confirm"),
-                InlineKeyboardButton("❌ Нет, отмена", callback_data="reboot_cancel")
-            )
-            bot.edit_message_text("⚠️ Вы уверены, что хотите перезагрузить компьютер?", call.message.chat.id,
-                                  call.message.message_id, reply_markup=keyboard)
-        except:
-            pass
-
-    elif action == "reboot_confirm":
-        try:
-            bot.edit_message_text("✅ Компьютер будет перезагружен через 1 минуту!", call.message.chat.id,
-                                  call.message.message_id)
-            log_command("System Reboot", "Initiated by bot")
-            os.system("shutdown /r /t 60")
-        except:
-            pass
-
-    elif action == "reboot_cancel":
-        keyboard = create_main_menu()
-        try:
-            bot.edit_message_text("❌ Перезагрузка отменена", call.message.chat.id,
-                                  call.message.message_id, reply_markup=keyboard)
-        except:
-            pass
-
-    elif action == "screenshot":
-        try:
-            screenshot_path = take_screenshot()
-            if screenshot_path:
-                with open(screenshot_path, 'rb') as photo:
-                    bot.send_photo(call.message.chat.id, photo, caption="📸 Скриншот выполнен успешно")
-                os.unlink(screenshot_path)
-                log_command("Screenshot", "Taken")
-            else:
-                bot.answer_callback_query(call.id, "❌ Ошибка создания скриншота")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "file_manager":
-        user_state["file_manager_page"] = 0
-        try:
-            bot.edit_message_text("📁 Управление файлами - выберите диск:", call.message.chat.id,
-                                  call.message.message_id, reply_markup=create_file_manager_keyboard())
-        except:
-            pass
-
-    elif action.startswith("folder_"):
-        path = action[7:]
-        try:
-            if not os.path.exists(path):
-                bot.answer_callback_query(call.id, "❌ Папка не существует")
-                return
-
-            if not os.path.isdir(path):
-                bot.answer_callback_query(call.id, "❌ Это не папка")
-                return
-
-            user_state["current_directory"] = path
-            user_state["file_manager_page"] = 0
-
+                text = self.root.clipboard_get()
+                if text:
+                    widget = event.widget
+                    try:
+                        widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                    except:
+                        pass
+                    widget.insert(tk.INSERT, text)
+            except Exception:
+                pass
+            return "break"
+        tk.Label(content, text="Telegram Bot Token:", bg="#1a1a1a",
+                fg="#e0e0e0", font=("Segoe UI", 10)).grid(
+            row=0, column=0, sticky=tk.W, padx=25, pady=(25, 5))
+        self.entry_token = tk.Entry(content, width=50, bg="#2d2d2d", fg="white",
+                                   insertbackground="white", font=("Segoe UI", 9),
+                                   relief=tk.FLAT, borderwidth=1,
+                                   highlightthickness=1, highlightbackground="#3c3c3c",
+                                   highlightcolor="#0078d4")
+        self.entry_token.grid(row=1, column=0, padx=25, pady=(0, 15), sticky=tk.EW)
+        self.entry_token.bind("<Control-v>", on_paste)
+        self.entry_token.bind("<Shift-Insert>", on_paste)
+        tk.Label(content, text="Chat ID:", bg="#1a1a1a",
+                fg="#e0e0e0", font=("Segoe UI", 10)).grid(
+            row=2, column=0, sticky=tk.W, padx=25, pady=(0, 5))
+        self.entry_chat = tk.Entry(content, width=50, bg="#2d2d2d", fg="white",
+                                  insertbackground="white", font=("Segoe UI", 9),
+                                  relief=tk.FLAT, borderwidth=1,
+                                  highlightthickness=1, highlightbackground="#3c3c3c",
+                                  highlightcolor="#0078d4")
+        self.entry_chat.grid(row=3, column=0, padx=25, pady=(0, 15), sticky=tk.EW)
+        self.entry_chat.bind("<Control-v>", on_paste)
+        self.entry_chat.bind("<Shift-Insert>", on_paste)
+        tk.Label(content, text="Путь установки:", bg="#1a1a1a",
+                fg="#e0e0e0", font=("Segoe UI", 10)).grid(
+            row=4, column=0, sticky=tk.W, padx=25, pady=(0, 5))
+        path_frame = tk.Frame(content, bg="#1a1a1a")
+        path_frame.grid(row=5, column=0, padx=25, pady=(0, 15), sticky=tk.EW)
+        self.entry_path = tk.Entry(path_frame, width=38, bg="#2d2d2d", fg="white",
+                                   insertbackground="white", font=("Segoe UI", 9),
+                                   relief=tk.FLAT, borderwidth=1,
+                                   highlightthickness=1, highlightbackground="#3c3c3c",
+                                   highlightcolor="#0078d4")
+        self.entry_path.insert(0, default_path)
+        self.entry_path.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.entry_path.bind("<Control-v>", on_paste)
+        self.entry_path.bind("<Shift-Insert>", on_paste)
+        tk.Button(path_frame, text="Обзор...", command=self._browse,
+                 bg="#0078d4", fg="white", font=("Segoe UI", 9),
+                 relief=tk.FLAT, width=10, cursor="hand2",
+                 activebackground="#106ebe").pack(side=tk.LEFT, padx=(10, 0))
+        tk.Checkbutton(content, text="Добавить в список приложений",
+                      variable=self.add_start, bg="#1a1a1a", fg="#e0e0e0",
+                      selectcolor="#0078d4", activebackground="#1a1a1a",
+                      activeforeground="#e0e0e0", font=("Segoe UI", 9),
+                      cursor="hand2").grid(row=6, column=0, sticky=tk.W, padx=25, pady=(0, 8))
+        tk.Checkbutton(content, text="Добавить ярлык на рабочий стол",
+                      variable=self.add_desktop, bg="#1a1a1a", fg="#e0e0e0",
+                      selectcolor="#0078d4", activebackground="#1a1a1a",
+                      activeforeground="#e0e0e0", font=("Segoe UI", 9),
+                      cursor="hand2").grid(row=7, column=0, sticky=tk.W, padx=25, pady=(0, 15))
+        btn_frame = tk.Frame(content, bg="#1a1a1a")
+        btn_frame.grid(row=8, column=0, padx=25, pady=(10, 25), sticky=tk.E)
+        tk.Button(btn_frame, text="Отмена", command=self._on_close,
+                 bg="#3c3c3c", fg="white", font=("Segoe UI", 10),
+                 relief=tk.FLAT, width=12, height=1, cursor="hand2",
+                 activebackground="#4c4c4c").pack(side=tk.RIGHT, padx=(10, 0))
+        tk.Button(btn_frame, text="Установить", command=self._install,
+                 bg="#0078d4", fg="white", font=("Segoe UI", 10, "bold"),
+                 relief=tk.FLAT, width=12, height=1, cursor="hand2",
+                 activebackground="#106ebe").pack(side=tk.RIGHT)
+        content.columnconfigure(0, weight=1)
+        path_frame.columnconfigure(0, weight=1)
+    
+    def _browse(self):
+        folder = filedialog.askdirectory(title="Выберите папку для установки")
+        if folder:
+            self.entry_path.delete(0, tk.END)
+            self.entry_path.insert(0, os.path.join(folder, "ControlPCbotV2"))
+    
+    def _install(self):
+        token = self.entry_token.get().strip()
+        chat_id = self.entry_chat.get().strip()
+        path = self.entry_path.get().strip()
+        if not token:
+            messagebox.showerror("Ошибка", "Введите Telegram Bot Token")
+            return
+        if not chat_id or not chat_id.isdigit():
+            messagebox.showerror("Ошибка", "Введите корректный Chat ID")
+            return
+        self.result = {
+            "token": token,
+            "chat_id": chat_id,
+            "path": path,
+            "start": self.add_start.get(),
+            "desktop": self.add_desktop.get()
+        }
+        self._close()
+    
+    def _on_close(self):
+        self.result = None
+        self._close()
+    
+    def _close(self):
+        if self.root:
             try:
-                items = os.listdir(path)
-                content = f"📂 Содержимое папки: {path}\n\nНайдено элементов: {len(items)}"
-                bot.edit_message_text(content, call.message.chat.id,
-                                      call.message.message_id, reply_markup=create_directory_keyboard(path))
-            except PermissionError:
-                bot.answer_callback_query(call.id, "❌ Нет доступа к папке")
+                self.root.quit()
+                self.root.destroy()
+            except Exception:
+                pass
+            finally:
+                self.root = None
+    
+    def show(self):
+        if not self.root:
+            self._create_window()
+        self.root.mainloop()
+        return self.result
+
+def run_installer():
+    if not is_frozen():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Ошибка",
+            "Установка возможна только из скомпилированного exe файла.\n"
+            "Сначала скомпилируйте программу через compile.bat")
+        root.destroy()
+        return
+    installer = InstallerWindow()
+    result = installer.show()
+    if not result:
+        return
+    install_path = result["path"]
+    token = result["token"]
+    chat_id = result["chat_id"]
+    add_start = result["start"]
+    add_desktop = result["desktop"]
+    abs_path = os.path.abspath(install_path)
+    pf = os.environ.get("ProgramFiles")
+    pf86 = os.environ.get("ProgramFiles(x86)")
+    needs_admin = False
+    if pf and os.path.commonpath([abs_path, os.path.abspath(pf)]) == os.path.abspath(pf):
+        needs_admin = True
+    if pf86 and os.path.commonpath([abs_path, os.path.abspath(pf86)]) == os.path.abspath(pf86):
+        needs_admin = True
+    if needs_admin and not is_admin():
+        root = tk.Tk()
+        root.withdraw()
+        if messagebox.askyesno("Требуются права администратора",
+                              "Для установки в Program Files требуются права администратора.\n"
+                              "Перезапустить установщик от имени администратора?"):
+            root.destroy()
+            if run_as_admin():
+                sys.exit(0)
+        root.destroy()
+        return
+    if os.path.exists(install_path):
+        root = tk.Tk()
+        root.withdraw()
+        if not messagebox.askyesno("Папка существует",
+                                  f"Папка {install_path} уже существует.\nПерезаписать?"):
+            root.destroy()
+            return
+        root.destroy()
+        try:
+            shutil.rmtree(install_path)
+        except Exception as e:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("Ошибка", f"Не удалось удалить папку:\n{str(e)}")
+            root.destroy()
+            return
+    try:
+        os.makedirs(install_path, exist_ok=True)
+        main_exe = os.path.join(install_path, 'ControlPCbotV2.exe')
+        shutil.copy(sys.executable, main_exe)
+        config_path = os.path.join(install_path, 'config.json')
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump({'TOKEN': token, 'CHAT_ID': int(chat_id)}, f, indent=2)
+        icon_path = main_exe
+        icon_source = os.path.join(get_app_dir(), 'icon.ico')
+        if os.path.exists(icon_source):
+            try:
+                shutil.copy(icon_source, os.path.join(install_path, 'icon.ico'))
+            except Exception:
+                pass
+        if add_start:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                  r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                  0, winreg.KEY_SET_VALUE) as key:
+                    winreg.SetValueEx(key, "ControlPCbotV2", 0, winreg.REG_SZ, f'"{main_exe}"')
+            except Exception:
+                pass
+        try:
+            import win32com.client
+            shell = win32com.client.Dispatch("WScript.Shell")
+            if add_start:
+                start_menu = os.path.join(
+                    os.environ.get('APPDATA', ''),
+                    'Microsoft', 'Windows', 'Start Menu', 'Programs'
+                )
+                shortcut = os.path.join(start_menu, 'ControlPCbotV2.lnk')
+                sc = shell.CreateShortCut(shortcut)
+                sc.Targetpath = main_exe
+                sc.WorkingDirectory = os.path.dirname(main_exe)
+                sc.IconLocation = icon_path
+                sc.save()
+            if add_desktop:
+                desktop = os.path.join(os.environ.get('USERPROFILE', ''), 'Desktop')
+                shortcut = os.path.join(desktop, 'ControlPCbotV2.lnk')
+                sc = shell.CreateShortCut(shortcut)
+                sc.Targetpath = main_exe
+                sc.WorkingDirectory = os.path.dirname(main_exe)
+                sc.IconLocation = icon_path
+                sc.save()
+        except Exception:
+            pass
+        root = tk.Tk()
+        root.withdraw()
+        if messagebox.askyesno("Успех",
+                              "Установка завершена успешно!\n\n"
+                              "Программа будет запущена автоматически при следующем входе в систему.\n\n"
+                              "Запустить программу сейчас?"):
+            root.destroy()
+            time.sleep(0.5)
+            try:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+                subprocess.Popen([main_exe], cwd=install_path, shell=False, startupinfo=startupinfo)
+            except Exception:
+                pass
+        else:
+            root.destroy()
+    except Exception as e:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Ошибка установки", f"Произошла ошибка при установке:\n{str(e)}")
+        root.destroy()
+
+class BotApp:
+    def __init__(self):
+        self.app_dir = get_app_dir()
+        self.data_dir = get_data_dir()
+        self.config_path = os.path.join(self.app_dir, 'config.json')
+        self.log_file = os.path.join(self.data_dir, 'command_log.txt')
+        self.bot = None
+        self.bot_thread = None
+        self.running = False
+        self.icon = None
+        self.user_state = {}
+        self.process_cache = {}
+        self.process_cache_time = 0
+        self.process_cache_ttl = 5
+        self.token = ""
+        self.chat_id = 0
+        self._setup_logging()
+        self._load_config()
+    
+    def _setup_logging(self):
+        log_file = os.path.join(self.data_dir, 'app.log')
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[logging.FileHandler(log_file, encoding='utf-8')]
+        )
+    
+    def _load_config(self):
+        try:
+            if os.path.exists(self.config_path):
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    self.token = config.get('TOKEN', '')
+                    self.chat_id = config.get('CHAT_ID', 0)
+        except Exception as e:
+            logging.error(f"Ошибка загрузки конфигурации: {e}")
+    
+    def _log_command(self, command, output):
+        try:
+            if os.path.exists(self.log_file):
+                file_size = os.path.getsize(self.log_file)
+                if file_size > 10 * 1024 * 1024:
+                    try:
+                        with open(self.log_file, 'r', encoding='utf-8') as f:
+                            lines = f.readlines()
+                        if len(lines) > 1000:
+                            with open(self.log_file, 'w', encoding='utf-8') as f:
+                                f.writelines(lines[-1000:])
+                    except Exception:
+                        os.remove(self.log_file)
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(f"[{timestamp}] Command: {command}\n")
+                output_preview = output[:5000] if len(output) > 5000 else output
+                f.write(f"Output: {output_preview}\n\n")
+        except Exception as e:
+            logging.error(f"Ошибка записи в лог: {e}")
+    
+    def _show_notification(self, message):
+        try:
+            toaster = ToastNotifier()
+            toaster.show_toast("ControlPCbotV2", message, duration=3, threaded=True)
+        except Exception:
+            pass
+    
+    def _create_icon(self):
+        image = Image.new('RGB', (64, 64), color='#0078d4')
+        draw = ImageDraw.Draw(image)
+        draw.ellipse([16, 16, 48, 48], fill='white')
+        return image
+    
+    def start_bot(self):
+        if not self.token or not self.chat_id:
+            self._show_notification("Ошибка: Не настроены токен или Chat ID")
+            return
+        if self.running:
+            return
+        self.running = True
+        try:
+            self.bot_thread = threading.Thread(target=self._run_bot, daemon=True)
+            self.bot_thread.start()
+            self._show_notification("Бот запущен")
+        except Exception as e:
+            self.running = False
+            self._show_notification(f"Ошибка запуска: {str(e)[:50]}")
+            logging.error(f"Ошибка запуска бота: {e}")
+    
+    def stop_bot(self):
+        if not self.running:
+            return
+        self.running = False
+        if self.bot:
+            try:
+                self.bot.stop_polling()
+            except Exception:
+                pass
+        if self.bot_thread and self.bot_thread.is_alive():
+            self.bot_thread.join(timeout=2)
+        self._show_notification("Бот остановлен")
+    
+    def _run_bot(self):
+        try:
+            self.bot = telebot.TeleBot(self.token)
+            self._setup_bot_handlers()
+            while self.running:
+                try:
+                    self.bot.polling(none_stop=True, interval=0, timeout=20)
+                except telebot.apihelper.ApiTelegramException as e:
+                    if not self.running:
+                        break
+                    error_str = str(e)
+                    if "Unauthorized" in error_str or "invalid token" in error_str.lower():
+                        logging.error("Неверный токен бота")
+                        self._show_notification("Ошибка: Неверный токен бота")
+                        self.running = False
+                        break
+                    elif "Conflict" in error_str:
+                        time.sleep(30)
+                    else:
+                        logging.error(f"Telegram API ошибка: {e}")
+                        time.sleep(10)
+                except Exception as e:
+                    if not self.running:
+                        break
+                    logging.error(f"Ошибка бота: {e}")
+                    time.sleep(5)
+        except Exception as e:
+            logging.error(f"Критическая ошибка в _run_bot: {e}")
+            self.running = False
+            self._show_notification(f"Ошибка запуска: {str(e)[:50]}")
+    
+    def _setup_bot_handlers(self):
+        @self.bot.message_handler(func=lambda m: m.chat.id != self.chat_id)
+        def handle_unauthorized(message):
+            self.bot.reply_to(message, "⛔ Доступ запрещен")
+        
+        @self.bot.message_handler(commands=['start', 'help', 'menu'])
+        def send_welcome(message):
+            if message.chat.id != self.chat_id:
+                return
+            help_text = (
+                "🤖 ControlPCbotV2 - Бот управления компьютером\n\n"
+                "Доступные команды:\n"
+                "/menu - Главное меню\n"
+                "/cmd [команда] - Выполнить команду в CMD\n\n"
+                "Автор: https://github.com/MrachniyTipchek"
+            )
+            keyboard = self._create_main_menu()
+            self.bot.send_message(message.chat.id, help_text, reply_markup=keyboard)
+        
+        @self.bot.message_handler(commands=['cmd'])
+        def handle_cmd(message):
+            if message.chat.id != self.chat_id:
+                return
+            command = message.text.replace('/cmd', '', 1).strip()
+            if not command:
+                self.bot.reply_to(message, "ℹ️ Использование: /cmd [команда]")
+                return
+            dangerous_commands = ['format', 'del /f /s /q', 'rmdir /s /q']
+            if any(danger in command.lower() for danger in dangerous_commands):
+                self.bot.reply_to(message, "⚠️ Выполнение опасных команд ограничено")
+                self._log_command(command, "Blocked: dangerous command")
+                return
+            temp_file = None
+            try:
+                encodings = ['utf-8', 'cp866', 'cp1251', 'latin-1']
+                output = None
+                error_output = None
+                result = subprocess.run(
+                    command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=CONFIG["CMD_TIMEOUT"], cwd=os.path.expanduser("~")
+                )
+                for encoding in encodings:
+                    try:
+                        if result.stdout:
+                            output = result.stdout.decode(encoding, errors='replace')
+                        if result.stderr:
+                            error_output = result.stderr.decode(encoding, errors='replace')
+                        break
+                    except (UnicodeDecodeError, AttributeError):
+                        continue
+                if not output and error_output:
+                    output = error_output
+                elif output and error_output:
+                    output = f"{output}\n\nОшибки:\n{error_output}"
+                if not output:
+                    output = "Команда выполнена успешно" if result.returncode == 0 else "Команда завершилась с ошибкой"
+                self._log_command(command, output)
+                if len(output) > CONFIG["MESSAGE_MAX_LENGTH"]:
+                    temp_file = get_temp_file("controlpcbot_output_", ".txt")
+                    try:
+                        with open(temp_file, 'w', encoding="utf-8") as f:
+                            f.write(output)
+                        with open(temp_file, "rb") as f:
+                            self.bot.send_document(message.chat.id, f, caption="Результат выполнения команды")
+                    except Exception as e:
+                        logging.error(f"Ошибка отправки файла: {e}")
+                        self.bot.reply_to(message, f"⚠️ Ошибка: {str(e)}")
+                    finally:
+                        if temp_file and os.path.exists(temp_file):
+                            try:
+                                os.remove(temp_file)
+                            except Exception:
+                                pass
+                else:
+                    try:
+                        self.bot.reply_to(message, f"```\n{output}\n```", parse_mode="Markdown")
+                    except Exception:
+                        self.bot.reply_to(message, output)
+            except subprocess.TimeoutExpired:
+                self._log_command(command, "Timeout")
+                self.bot.reply_to(message, "⚠️ Команда превысила время ожидания")
             except Exception as e:
-                bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
+                logging.error(f"Ошибка выполнения команды: {e}")
+                self._log_command(command, f"Error: {str(e)}")
+                self.bot.reply_to(message, f"⚠️ Ошибка: {str(e)}")
+            finally:
+                if temp_file and os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except Exception:
+                        pass
+        
+        @self.bot.callback_query_handler(func=lambda call: call.message.chat.id == self.chat_id)
+        def handle_callback(call):
+            try:
+                self.bot.answer_callback_query(call.id)
+            except Exception:
+                pass
+            try:
+                action = call.data
+                if not action or len(action) > CONFIG["CALLBACK_DATA_MAX_LENGTH"]:
+                    return
+                if action == "main_menu":
+                    keyboard = self._create_main_menu()
+                    try:
+                        self.bot.edit_message_text("📱 Главное меню управления ControlPCbotV2:",
+                                                  call.message.chat.id, call.message.message_id,
+                                                  reply_markup=keyboard)
+                    except Exception:
+                        try:
+                            self.bot.send_message(call.message.chat.id, "📱 Главное меню управления ControlPCbotV2:",
+                                                 reply_markup=keyboard)
+                        except Exception:
+                            pass
+                elif action == "screenshot":
+                    self._handle_screenshot(call)
+                elif action == "shutdown":
+                    self._handle_shutdown_confirm(call)
+                elif action == "shutdown_confirm":
+                    self._handle_shutdown_execute(call)
+                elif action == "reboot":
+                    self._handle_reboot_confirm(call)
+                elif action == "reboot_confirm":
+                    self._handle_reboot_execute(call)
+                elif action == "lock_screen":
+                    self._handle_lock_screen(call)
+                elif action == "volume_control":
+                    self._handle_volume_menu(call)
+                elif action == "volume_mute":
+                    self._handle_volume_mute(call)
+                elif action == "volume_up":
+                    self._handle_volume_up(call)
+                elif action == "volume_down":
+                    self._handle_volume_down(call)
+                elif action == "file_manager":
+                    self._handle_file_manager(call)
+                elif action == "proc_menu":
+                    self._handle_process_menu(call)
+                elif action == "proc_list_apps":
+                    self.user_state["last_process_category"] = "apps"
+                    self._handle_process_list(call, "apps", 0)
+                elif action == "proc_list_bg":
+                    self.user_state["last_process_category"] = "bg"
+                    self._handle_process_list(call, "bg", 0)
+                elif action == "proc_list_sys":
+                    self.user_state["last_process_category"] = "sys"
+                    self._handle_process_list(call, "sys", 0)
+                elif action.startswith("file_"):
+                    self._handle_file_action(call, action)
+                elif action.startswith("proc_"):
+                    self._handle_process_action(call, action)
+            except Exception as e:
+                logging.error(f"Ошибка обработки callback: {e}")
+                try:
+                    self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)[:50]}")
+                except Exception:
+                    pass
+    
+    def _create_main_menu(self):
+        keyboard = InlineKeyboardMarkup(row_width=2)
+        buttons = [
+            InlineKeyboardButton("🖥️ Выключить ПК", callback_data="shutdown"),
+            InlineKeyboardButton("🔄 Перезагрузить ПК", callback_data="reboot"),
+            InlineKeyboardButton("📸 Скриншот", callback_data="screenshot"),
+            InlineKeyboardButton("📁 Управление файлами", callback_data="file_manager"),
+            InlineKeyboardButton("⚙️ Управление процессами", callback_data="proc_menu"),
+            InlineKeyboardButton("🔊 Управление громкостью", callback_data="volume_control"),
+            InlineKeyboardButton("🔒 Блокировка экрана", callback_data="lock_screen"),
+        ]
+        keyboard.add(*buttons)
+        return keyboard
+    
+    def _handle_screenshot(self, call):
+        temp_file = None
+        try:
+            screenshot = pyautogui.screenshot()
+            temp_file = get_temp_file("controlpcbot_screenshot_", ".png")
+            screenshot.save(temp_file, 'PNG')
+            with open(temp_file, 'rb') as photo:
+                self.bot.send_photo(call.message.chat.id, photo, caption="📸 Скриншот выполнен успешно")
+            self._log_command("Screenshot", "Taken")
         except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка доступа: {str(e)}")
-
-    elif action.startswith("file_"):
-        file_path = action[5:]
+            logging.error(f"Ошибка создания скриншота: {e}")
+            try:
+                self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
+            except Exception:
+                pass
+        finally:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
+    
+    def _handle_shutdown_confirm(self, call):
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(
+            InlineKeyboardButton("✅ Да, завершить", callback_data="shutdown_confirm"),
+            InlineKeyboardButton("❌ Нет, отмена", callback_data="main_menu")
+        )
         try:
-            if os.path.exists(file_path):
-                with open(file_path, 'rb') as f:
-                    bot.send_document(call.message.chat.id, f, caption=f"📄 {os.path.basename(file_path)}")
-            else:
-                bot.answer_callback_query(call.id, "❌ Файл не найден")
+            self.bot.edit_message_text("⚠️ Вы уверены, что хотите выключить компьютер?",
+                                      call.message.chat.id, call.message.message_id,
+                                      reply_markup=keyboard)
+        except Exception:
+            try:
+                self.bot.send_message(call.message.chat.id, "⚠️ Вы уверены, что хотите выключить компьютер?",
+                                     reply_markup=keyboard)
+            except Exception:
+                pass
+    
+    def _handle_shutdown_execute(self, call):
+        try:
+            self.bot.edit_message_text("✅ Компьютер будет выключен через 1 минуту!",
+                                      call.message.chat.id, call.message.message_id)
+            self._log_command("System Shutdown", "Initiated")
+            subprocess.run(['shutdown', '/s', '/t', str(CONFIG["SHUTDOWN_DELAY"])],
+                          check=False, timeout=5)
         except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка отправки файла: {str(e)}")
-
-    elif action == "upload_here":
-        current_dir = user_state["current_directory"]
+            logging.error(f"Ошибка выключения компьютера: {e}")
+            try:
+                self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
+            except Exception:
+                pass
+    
+    def _handle_reboot_confirm(self, call):
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(
+            InlineKeyboardButton("✅ Да, перезагрузить", callback_data="reboot_confirm"),
+            InlineKeyboardButton("❌ Нет, отмена", callback_data="main_menu")
+        )
         try:
-            bot.edit_message_text(f"📤 Отправьте файл для загрузки в папку:\n{current_dir}", call.message.chat.id,
-                                  call.message.message_id)
-            user_state["waiting_for_path"] = "upload_file"
-            user_state["upload_path"] = current_dir
-        except:
-            pass
-
-    elif action == "archive_folder":
-        current_dir = user_state["current_directory"]
+            self.bot.edit_message_text("⚠️ Вы уверены, что хотите перезагрузить компьютер?",
+                                      call.message.chat.id, call.message.message_id,
+                                      reply_markup=keyboard)
+        except Exception:
+            try:
+                self.bot.send_message(call.message.chat.id, "⚠️ Вы уверены, что хотите перезагрузить компьютер?",
+                                     reply_markup=keyboard)
+            except Exception:
+                pass
+    
+    def _handle_reboot_execute(self, call):
         try:
-            temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
-            temp_zip.close()
-            create_zip_archive(current_dir, temp_zip.name)
-            with open(temp_zip.name, 'rb') as zip_file:
-                bot.send_document(call.message.chat.id, zip_file,
-                                  caption=f"📦 Архив папки: {os.path.basename(current_dir)}")
-            os.unlink(temp_zip.name)
-            log_command("Archive Folder", f"Archived: {current_dir}")
+            self.bot.edit_message_text("✅ Компьютер будет перезагружен через 1 минуту!",
+                                      call.message.chat.id, call.message.message_id)
+            self._log_command("System Reboot", "Initiated")
+            subprocess.run(['shutdown', '/r', '/t', str(CONFIG["SHUTDOWN_DELAY"])],
+                          check=False, timeout=5)
         except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка архивации: {str(e)}")
-
-    elif action == "get_file_here":
-        current_dir = user_state["current_directory"]
-        try:
-            bot.edit_message_text(f"📥 Введите имя файла для извлечения из папки:\n{current_dir}", call.message.chat.id,
-                                  call.message.message_id)
-            user_state["waiting_for_path"] = "get_file"
-        except:
-            pass
-
-    elif action == "enter_path":
-        try:
-            bot.edit_message_text("⌨️ Введите полный путь к папке:", call.message.chat.id, call.message.message_id)
-            user_state["waiting_for_path"] = "enter_folder"
-        except:
-            pass
-
-    elif action == "file_manager_prev":
-        if user_state["file_manager_page"] > 0:
-            user_state["file_manager_page"] -= 1
-        current_dir = user_state["current_directory"]
-        try:
-            items = os.listdir(current_dir)
-            content = f"📂 Содержимое папки: {current_dir}\n\nНайдено элементов: {len(items)}"
-            bot.edit_message_text(content, call.message.chat.id,
-                                  call.message.message_id, reply_markup=create_directory_keyboard(current_dir))
-        except:
-            pass
-
-    elif action == "file_manager_next":
-        user_state["file_manager_page"] += 1
-        current_dir = user_state["current_directory"]
-        try:
-            items = os.listdir(current_dir)
-            content = f"📂 Содержимое папки: {current_dir}\n\nНайдено элементов: {len(items)}"
-            bot.edit_message_text(content, call.message.chat.id,
-                                  call.message.message_id, reply_markup=create_directory_keyboard(current_dir))
-        except:
-            pass
-
-    elif action == "log":
-        try:
-            with open("command_log.txt", "rb") as f:
-                bot.send_document(call.message.chat.id, f, caption="📝 Лог команд")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"⚠️ Ошибка: {str(e)}")
-
-    elif action == "kill_menu":
-        try:
-            process_text, process_list = create_process_list_message()
-            user_state["process_list"] = process_list
-            user_state["waiting_for_process_kill"] = True
-
-            keyboard = InlineKeyboardMarkup()
-            keyboard.add(InlineKeyboardButton("🔄 Обновить список", callback_data="kill_menu"))
-            system_text = "✅ Системные" if user_state["show_system_processes"] else "❌ Системные"
-            keyboard.add(InlineKeyboardButton(f"{system_text} процессы", callback_data="toggle_system"))
-            keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu"))
-
-            bot.edit_message_text(process_text, call.message.chat.id, call.message.message_id, reply_markup=keyboard)
-        except:
-            pass
-
-    elif action == "toggle_system":
-        user_state["show_system_processes"] = not user_state["show_system_processes"]
-        try:
-            process_text, process_list = create_process_list_message()
-            user_state["process_list"] = process_list
-
-            keyboard = InlineKeyboardMarkup()
-            keyboard.add(InlineKeyboardButton("🔄 Обновить список", callback_data="kill_menu"))
-            system_text = "✅ Системные" if user_state["show_system_processes"] else "❌ Системные"
-            keyboard.add(InlineKeyboardButton(f"{system_text} процессы", callback_data="toggle_system"))
-            keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu"))
-
-            bot.edit_message_text(process_text, call.message.chat.id, call.message.message_id, reply_markup=keyboard)
-        except:
-            pass
-
-    elif action == "volume_control":
-        try:
-            bot.edit_message_text("🔊 Управление громкостью - выберите действие:", call.message.chat.id,
-                                  call.message.message_id, reply_markup=create_volume_keyboard())
-        except:
-            pass
-
-    elif action == "volume_mute":
-        try:
-            pyautogui.press('volumemute')
-            bot.answer_callback_query(call.id, "🔇 Звук отключен")
-            log_command("Volume Control", "Mute")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "volume_up":
-        try:
-            pyautogui.press('volumeup')
-            bot.answer_callback_query(call.id, "🔊 Громкость увеличена")
-            log_command("Volume Control", "Volume Up")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "volume_down":
-        try:
-            pyautogui.press('volumedown')
-            bot.answer_callback_query(call.id, "🔈 Громкость уменьшена")
-            log_command("Volume Control", "Volume Down")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "key_emulation":
-        try:
-            bot.edit_message_text("⌨️ Выберите тип эмуляции:", call.message.chat.id, call.message.message_id,
-                                  reply_markup=create_key_emulation_keyboard())
-        except:
-            pass
-
-    elif action == "emulate_text":
-        try:
-            bot.edit_message_text("💬 Введите текст для эмуляции ввода:", call.message.chat.id, call.message.message_id)
-            user_state["waiting_for_emulation_text"] = True
-        except:
-            pass
-
-    elif action == "special_keys":
-        try:
-            bot.edit_message_text("⌨️ Выберите специальную клавишу:", call.message.chat.id, call.message.message_id,
-                                  reply_markup=create_special_keys_keyboard())
-        except:
-            pass
-
-    elif action == "key_combinations":
-        try:
-            bot.edit_message_text("⌨️ Выберите сочетание клавиш:", call.message.chat.id, call.message.message_id,
-                                  reply_markup=create_key_combinations_keyboard())
-        except:
-            pass
-
-    elif action.startswith("key_"):
-        key = action[4:]
-        try:
-            if key == 'Win':
-                pyautogui.press('win')
-            else:
-                pyautogui.press(key.lower())
-            bot.answer_callback_query(call.id, f"✅ Клавиша {key} нажата")
-            log_command("Key Press", f"Key: {key}")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action.startswith("comb_"):
-        comb = action[5:]
-        try:
-            if comb == "lock":
-                ctypes.windll.user32.LockWorkStation()
-                bot.answer_callback_query(call.id, "🔒 Экран заблокирован")
-            elif comb == "alt_tab":
-                pyautogui.hotkey('alt', 'tab')
-                bot.answer_callback_query(call.id, "✅ Alt+Tab выполнено")
-            elif comb == "ctrl_c":
-                pyautogui.hotkey('ctrl', 'c')
-                bot.answer_callback_query(call.id, "✅ Ctrl+C выполнено")
-            elif comb == "ctrl_v":
-                pyautogui.hotkey('ctrl', 'v')
-                bot.answer_callback_query(call.id, "✅ Ctrl+V выполнено")
-            elif comb == "ctrl_z":
-                pyautogui.hotkey('ctrl', 'z')
-                bot.answer_callback_query(call.id, "✅ Ctrl+Z выполнено")
-            elif comb == "ctrl_a":
-                pyautogui.hotkey('ctrl', 'a')
-                bot.answer_callback_query(call.id, "✅ Ctrl+A выполнено")
-            elif comb == "ctrl_s":
-                pyautogui.hotkey('ctrl', 's')
-                bot.answer_callback_query(call.id, "✅ Ctrl+S выполнено")
-            elif comb == "win_e":
-                pyautogui.hotkey('win', 'e')
-                bot.answer_callback_query(call.id, "✅ Win+E выполнено")
-            elif comb == "win_r":
-                pyautogui.hotkey('win', 'r')
-                bot.answer_callback_query(call.id, "✅ Win+R выполнено")
-            elif comb == "win_d":
-                pyautogui.hotkey('win', 'd')
-                bot.answer_callback_query(call.id, "✅ Win+D выполнено")
-            elif comb == "ctrl_shift_esc":
-                pyautogui.hotkey('ctrl', 'shift', 'esc')
-                bot.answer_callback_query(call.id, "✅ Ctrl+Shift+Esc выполнено")
-            elif comb == "alt_f4":
-                pyautogui.hotkey('alt', 'f4')
-                bot.answer_callback_query(call.id, "✅ Alt+F4 выполнено")
-            log_command("Key Combination", f"Combination: {comb}")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "mouse_emulation":
-        try:
-            bot.edit_message_text("🖱 Управление мышью - выберите действие:", call.message.chat.id,
-                                  call.message.message_id,
-                                  reply_markup=create_mouse_emulation_keyboard())
-        except:
-            pass
-
-    elif action == "mouse_up":
-        try:
-            pyautogui.move(0, -50)
-            bot.answer_callback_query(call.id, "✅ Мышь перемещена вверх")
-            log_command("Mouse Control", "Move Up")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "mouse_down":
-        try:
-            pyautogui.move(0, 50)
-            bot.answer_callback_query(call.id, "✅ Мышь перемещена вниз")
-            log_command("Mouse Control", "Move Down")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "mouse_left":
-        try:
-            pyautogui.move(-50, 0)
-            bot.answer_callback_query(call.id, "✅ Мышь перемещена влево")
-            log_command("Mouse Control", "Move Left")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "mouse_right":
-        try:
-            pyautogui.move(50, 0)
-            bot.answer_callback_query(call.id, "✅ Мышь перемещена вправо")
-            log_command("Mouse Control", "Move Right")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "mouse_left_click":
-        try:
-            pyautogui.click()
-            bot.answer_callback_query(call.id, "✅ ЛКМ нажата")
-            log_command("Mouse Control", "Left Click")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "mouse_right_click":
-        try:
-            pyautogui.click(button='right')
-            bot.answer_callback_query(call.id, "✅ ПКМ нажата")
-            log_command("Mouse Control", "Right Click")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "mouse_middle_click":
-        try:
-            pyautogui.click(button='middle')
-            bot.answer_callback_query(call.id, "✅ СКМ нажата")
-            log_command("Mouse Control", "Middle Click")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "mouse_scroll_up":
-        try:
-            pyautogui.scroll(100)
-            bot.answer_callback_query(call.id, "✅ Прокрутка вверх")
-            log_command("Mouse Control", "Scroll Up")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "mouse_scroll_down":
-        try:
-            pyautogui.scroll(-100)
-            bot.answer_callback_query(call.id, "✅ Прокрутка вниз")
-            log_command("Mouse Control", "Scroll Down")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "lock_screen":
+            logging.error(f"Ошибка перезагрузки компьютера: {e}")
+            try:
+                self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
+            except Exception:
+                pass
+    
+    def _handle_lock_screen(self, call):
         try:
             ctypes.windll.user32.LockWorkStation()
-            bot.send_message(call.message.chat.id, "🔒 Экран заблокирован")
-            log_command("Lock Screen", "Screen locked")
+            self.bot.send_message(call.message.chat.id, "🔒 Экран заблокирован")
+            self._log_command("Lock Screen", "Screen locked")
         except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
-
-    elif action == "cmdlist":
-        cmd_help = (
-            "📋 Основные CMD команды:\n\n"
-            "• `cd` - Сменить директорию\n"
-            "• `dir` - Показать содержимое папки\n"
-            "• `ipconfig` - Информация о сетевых подключениях\n"
-            "• `ping` - Проверить доступность хоста\n"
-            "• `shutdown /s /t 0` - Немедленное выключение\n"
-            "• `shutdown /r /t 0` - Немедленная перезагрузка\n"
-            "• `tasklist` - Список процессов\n"
-            "• `taskkill /F /PID <pid>` - Завершить процесс\n"
-            "• `systeminfo` - Информация о системе\n"
-            "• `curl` - Загрузка файлов из интернета\n\n"
-            "Для выполнения команд используйте /cmd [команда]"
-        )
-        bot.send_message(call.message.chat.id, cmd_help, parse_mode="Markdown")
-
-    elif action == "noop":
-        pass
-
-
-@bot.message_handler(content_types=['document'],
-                     func=lambda message: message.chat.id == config.CHAT_ID and user_state.get("upload_path"))
-def handle_file_upload(message):
-    try:
-        file_info = bot.get_file(message.document.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-
-        upload_dir = user_state["upload_path"]
-        filename = message.document.file_name
-        file_path = os.path.join(upload_dir, filename)
-
-        if not os.path.exists(upload_dir):
-            os.makedirs(upload_dir)
-
-        with open(file_path, 'wb') as new_file:
-            new_file.write(downloaded_file)
-
-        bot.reply_to(message, f"✅ Файл успешно загружен по пути:\n{file_path}")
-        log_command("File Upload", f"Uploaded to: {file_path}")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка загрузки файла: {str(e)}")
-        log_command("File Upload Error", str(e))
-    finally:
-        user_state["upload_path"] = None
-        keyboard = create_main_menu()
-        bot.send_message(message.chat.id, "📱 Возврат в главное меню:", reply_markup=keyboard)
-
-
-@bot.message_handler(func=lambda message: user_state.get("waiting_for_path") and message.chat.id == config.CHAT_ID)
-def handle_path_input(message):
-    path = message.text.strip()
-    action = user_state["waiting_for_path"]
-    user_state["waiting_for_path"] = None
-
-    if action == "get_file":
-        try:
-            if not os.path.exists(path):
-                bot.reply_to(message, "❌ Файл не существует")
-            elif os.path.isdir(path):
-                bot.reply_to(message, "❌ Указанный путь является папкой, а не файлом")
-            else:
-                with open(path, 'rb') as f:
-                    bot.send_document(message.chat.id, f, caption=f"📄 {os.path.basename(path)}")
-        except Exception as e:
-            bot.reply_to(message, f"⚠️ Ошибка: {str(e)}")
-        finally:
-            keyboard = create_main_menu()
-            bot.send_message(message.chat.id, "📱 Возврат в главное меню:", reply_markup=keyboard)
-
-    elif action == "enter_folder":
-        if os.path.exists(path) and os.path.isdir(path):
-            user_state["current_directory"] = path
-            user_state["file_manager_page"] = 0
             try:
-                items = os.listdir(path)
-                content = f"📂 Содержимое папки: {path}\n\nНайдено элементов: {len(items)}"
-                bot.reply_to(message, content, reply_markup=create_directory_keyboard(path))
-            except PermissionError:
-                bot.reply_to(message, "❌ Нет доступа к папке")
-                keyboard = create_main_menu()
-                bot.send_message(message.chat.id, "📱 Возврат в главное меню:", reply_markup=keyboard)
-            except Exception as e:
-                bot.reply_to(message, f"❌ Ошибка: {str(e)}")
-                keyboard = create_main_menu()
-                bot.send_message(message.chat.id, "📱 Возврат в главное меню:", reply_markup=keyboard)
-        else:
-            bot.reply_to(message, "❌ Указанный путь не существует или не является папкой")
-            keyboard = create_main_menu()
-            bot.send_message(message.chat.id, "📱 Возврат в главное меню:", reply_markup=keyboard)
+                self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
+            except Exception:
+                pass
+    
+    def _handle_volume_menu(self, call):
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("🔇 Mute", callback_data="volume_mute"))
+        keyboard.add(InlineKeyboardButton("🔊 Volume Up", callback_data="volume_up"))
+        keyboard.add(InlineKeyboardButton("🔈 Volume Down", callback_data="volume_down"))
+        keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu"))
+        try:
+            self.bot.edit_message_text("🔊 Управление громкостью - выберите действие:",
+                                      call.message.chat.id, call.message.message_id,
+                                      reply_markup=keyboard)
+        except Exception:
+            pass
+    
+    def _handle_volume_mute(self, call):
+        try:
+            pyautogui.press('volumemute')
+            self.bot.answer_callback_query(call.id, "🔇 Звук отключен")
+            self._log_command("Volume Control", "Mute")
+        except Exception as e:
+            try:
+                self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
+            except Exception:
+                pass
+    
+    def _handle_volume_up(self, call):
+        try:
+            pyautogui.press('volumeup')
+            self.bot.answer_callback_query(call.id, "🔊 Громкость увеличена")
+            self._log_command("Volume Control", "Volume Up")
+        except Exception as e:
+            try:
+                self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
+            except Exception:
+                pass
+    
+    def _handle_volume_down(self, call):
+        try:
+            pyautogui.press('volumedown')
+            self.bot.answer_callback_query(call.id, "🔈 Громкость уменьшена")
+            self._log_command("Volume Control", "Volume Down")
+        except Exception as e:
+            try:
+                self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
+            except Exception:
+                pass
+    
+    def _handle_file_manager(self, call):
+        self._show_file_manager(call, "C:\\", 0)
+    
+    def _show_file_manager(self, call, directory, page):
+        try:
+            if not directory or not isinstance(directory, str):
+                directory = os.path.expanduser("~")
+            try:
+                directory = os.path.abspath(os.path.normpath(directory))
+            except Exception:
+                directory = os.path.expanduser("~")
+            if not os.path.exists(directory) or not os.path.isdir(directory):
+                directory = os.path.expanduser("~")
+            items = []
+            parent_dir = os.path.dirname(directory)
+            if parent_dir != directory:
+                encoded = encode_path(parent_dir)
+                if encoded and len(f"file_nav_{encoded}") <= CONFIG["CALLBACK_DATA_MAX_LENGTH"]:
+                    items.append(("📁 ..", f"file_nav_{encoded}"))
+            try:
+                entries = sorted(os.listdir(directory))
+                for entry in entries:
+                    try:
+                        full_path = os.path.join(directory, entry)
+                        if len(full_path) > 260:
+                            continue
+                        if os.path.isdir(full_path):
+                            encoded = encode_path(full_path)
+                            if encoded and len(f"file_dir_{encoded}") <= CONFIG["CALLBACK_DATA_MAX_LENGTH"]:
+                                items.append((f"📁 {entry[:40]}", f"file_dir_{encoded}"))
+                        else:
+                            try:
+                                size = os.path.getsize(full_path)
+                                size_str = format_size(size)
+                                encoded = encode_path(full_path)
+                                if encoded and len(f"file_info_{encoded}") <= CONFIG["CALLBACK_DATA_MAX_LENGTH"]:
+                                    items.append((f"📄 {entry[:30]} ({size_str})", f"file_info_{encoded}"))
+                            except (OSError, PermissionError):
+                                continue
+                    except (OSError, PermissionError, UnicodeEncodeError):
+                        continue
+            except (OSError, PermissionError):
+                try:
+                    self.bot.answer_callback_query(call.id, "❌ Нет доступа к папке")
+                except Exception:
+                    pass
+                return
+            keyboard = InlineKeyboardMarkup(row_width=1)
+            start_idx = page * CONFIG["FILES_PER_PAGE"]
+            end_idx = start_idx + CONFIG["FILES_PER_PAGE"]
+            for item_text, callback_data in items[start_idx:end_idx]:
+                if len(callback_data) <= CONFIG["CALLBACK_DATA_MAX_LENGTH"]:
+                    keyboard.add(InlineKeyboardButton(item_text[:50], callback_data=callback_data))
+            nav_buttons = []
+            encoded_dir = encode_path(directory)
+            if encoded_dir:
+                prev_callback = f"file_pg_{page - 1}_{encoded_dir}"
+                next_callback = f"file_pg_{page + 1}_{encoded_dir}"
+                if page > 0 and len(prev_callback) <= CONFIG["CALLBACK_DATA_MAX_LENGTH"]:
+                    nav_buttons.append(InlineKeyboardButton("◀️ Назад", callback_data=prev_callback))
+                if end_idx < len(items) and len(next_callback) <= CONFIG["CALLBACK_DATA_MAX_LENGTH"]:
+                    nav_buttons.append(InlineKeyboardButton("Вперед ▶️", callback_data=next_callback))
+            if nav_buttons:
+                keyboard.add(*nav_buttons)
+            keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu"))
+            self.user_state["current_directory"] = directory
+            try:
+                self.bot.edit_message_text(f"📁 {directory}\n\nВыберите файл или папку:",
+                                          call.message.chat.id, call.message.message_id,
+                                          reply_markup=keyboard)
+            except Exception:
+                try:
+                    self.bot.send_message(call.message.chat.id, f"📁 {directory}\n\nВыберите файл или папку:",
+                                         reply_markup=keyboard)
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.error(f"Ошибка в _show_file_manager: {e}")
+            try:
+                self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)[:50]}")
+            except Exception:
+                pass
+    
+    def _handle_file_action(self, call, action):
+        try:
+            if action.startswith("file_nav_"):
+                encoded = action.replace("file_nav_", "", 1)
+                path = decode_path(encoded)
+                if path and os.path.exists(path):
+                    self._show_file_manager(call, path, 0)
+                else:
+                    self._show_file_manager(call, os.path.expanduser("~"), 0)
+            elif action.startswith("file_pg_"):
+                rest = action.replace("file_pg_", "", 1)
+                parts = rest.split("_", 1)
+                if len(parts) == 2:
+                    try:
+                        page = int(parts[0])
+                        encoded = parts[1]
+                        path = decode_path(encoded)
+                        if path and os.path.exists(path):
+                            self._show_file_manager(call, path, page)
+                        else:
+                            self._show_file_manager(call, os.path.expanduser("~"), 0)
+                    except Exception:
+                        self._show_file_manager(call, os.path.expanduser("~"), 0)
+            elif action.startswith("file_dir_"):
+                encoded = action.replace("file_dir_", "", 1)
+                dir_path = decode_path(encoded)
+                if not dir_path or not os.path.exists(dir_path) or not os.path.isdir(dir_path):
+                    try:
+                        self.bot.answer_callback_query(call.id, "❌ Папка не найдена")
+                    except Exception:
+                        pass
+                    return
+                try:
+                    keyboard = InlineKeyboardMarkup()
+                    encoded_dir = encode_path(dir_path)
+                    encoded_parent = encode_path(os.path.dirname(dir_path))
+                    keyboard.add(InlineKeyboardButton("👁️ Посмотреть содержимое", callback_data=f"file_nav_{encoded_dir}"))
+                    keyboard.add(InlineKeyboardButton("📦 Скачать папку (ZIP)", callback_data=f"file_zip_confirm_{encoded_dir}"))
+                    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data=f"file_nav_{encoded_parent}"))
+                    try:
+                        self.bot.edit_message_text(f"📁 {os.path.basename(dir_path)}\n\nВыберите действие:",
+                                                  call.message.chat.id, call.message.message_id,
+                                                  reply_markup=keyboard)
+                    except Exception:
+                        try:
+                            self.bot.send_message(call.message.chat.id, f"📁 {os.path.basename(dir_path)}\n\nВыберите действие:",
+                                                 reply_markup=keyboard)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    try:
+                        self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
+                    except Exception:
+                        pass
+            elif action.startswith("file_info_"):
+                encoded = action.replace("file_info_", "", 1)
+                file_path = decode_path(encoded)
+                if not file_path or not os.path.exists(file_path):
+                    try:
+                        self.bot.answer_callback_query(call.id, "❌ Файл не найден")
+                    except Exception:
+                        pass
+                    return
+                try:
+                    size = os.path.getsize(file_path)
+                    size_str = format_size(size)
+                    keyboard = InlineKeyboardMarkup()
+                    encoded_file = encode_path(file_path)
+                    encoded_parent = encode_path(os.path.dirname(file_path))
+                    keyboard.add(InlineKeyboardButton("📥 Скачать", callback_data=f"file_dl_confirm_{encoded_file}"))
+                    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data=f"file_nav_{encoded_parent}"))
+                    try:
+                        self.bot.edit_message_text(f"📄 {os.path.basename(file_path)}\n\nРазмер: {size_str}",
+                                                  call.message.chat.id, call.message.message_id,
+                                                  reply_markup=keyboard)
+                    except Exception:
+                        try:
+                            self.bot.send_message(call.message.chat.id, f"📄 {os.path.basename(file_path)}\n\nРазмер: {size_str}",
+                                                 reply_markup=keyboard)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    try:
+                        self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
+                    except Exception:
+                        pass
+            elif action.startswith("file_dl_confirm_"):
+                encoded = action.replace("file_dl_confirm_", "", 1)
+                file_path = decode_path(encoded)
+                if not file_path or not os.path.exists(file_path):
+                    try:
+                        self.bot.answer_callback_query(call.id, "❌ Файл не найден")
+                    except Exception:
+                        pass
+                    return
+                try:
+                    size = os.path.getsize(file_path)
+                    if size > CONFIG["TELEGRAM_MAX_FILE_SIZE"]:
+                        try:
+                            self.bot.answer_callback_query(call.id,
+                                f"❌ Файл слишком большой ({format_size(size)}). Макс: {format_size(CONFIG['TELEGRAM_MAX_FILE_SIZE'])}")
+                        except Exception:
+                            pass
+                        return
+                    size_str = format_size(size)
+                    keyboard = InlineKeyboardMarkup()
+                    encoded_file = encode_path(file_path)
+                    keyboard.add(InlineKeyboardButton("✅ Подтвердить", callback_data=f"file_dl_{encoded_file}"))
+                    keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data=f"file_info_{encoded_file}"))
+                    try:
+                        self.bot.edit_message_text(
+                            f"⚠️ Подтверждение отправки файла\n\n"
+                            f"📄 {os.path.basename(file_path)}\n"
+                            f"Размер: {size_str}\n\n"
+                            f"Подтвердите отправку:",
+                            call.message.chat.id, call.message.message_id,
+                            reply_markup=keyboard)
+                    except Exception:
+                        try:
+                            self.bot.send_message(call.message.chat.id,
+                                f"⚠️ Подтверждение отправки файла\n\n"
+                                f"📄 {os.path.basename(file_path)}\n"
+                                f"Размер: {size_str}\n\n"
+                                f"Подтвердите отправку:",
+                                reply_markup=keyboard)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logging.error(f"Ошибка в file_dl_confirm: {e}")
+                    try:
+                        self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)[:50]}")
+                    except Exception:
+                        pass
+            elif action.startswith("file_zip_confirm_"):
+                encoded = action.replace("file_zip_confirm_", "", 1)
+                dir_path = decode_path(encoded)
+                if not dir_path or not os.path.exists(dir_path) or not os.path.isdir(dir_path):
+                    try:
+                        self.bot.answer_callback_query(call.id, "❌ Папка не найдена")
+                    except Exception:
+                        pass
+                    return
+                try:
+                    total_size = 0
+                    for root, dirs, files in os.walk(dir_path):
+                        for file in files:
+                            try:
+                                file_path = os.path.join(root, file)
+                                if not os.path.isfile(file_path):
+                                    continue
+                                total_size += os.path.getsize(file_path)
+                                if total_size > CONFIG["TELEGRAM_MAX_FILE_SIZE"]:
+                                    break
+                            except (OSError, PermissionError):
+                                continue
+                        if total_size > CONFIG["TELEGRAM_MAX_FILE_SIZE"]:
+                            break
+                    if total_size > CONFIG["TELEGRAM_MAX_FILE_SIZE"]:
+                        try:
+                            self.bot.answer_callback_query(call.id,
+                                f"❌ Папка слишком большая ({format_size(total_size)}). Макс: {format_size(CONFIG['TELEGRAM_MAX_FILE_SIZE'])}")
+                        except Exception:
+                            pass
+                        return
+                    size_str = format_size(total_size)
+                    keyboard = InlineKeyboardMarkup()
+                    encoded_dir = encode_path(dir_path)
+                    keyboard.add(InlineKeyboardButton("✅ Подтвердить", callback_data=f"file_zip_{encoded_dir}"))
+                    keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data=f"file_dir_{encoded_dir}"))
+                    try:
+                        self.bot.edit_message_text(
+                            f"⚠️ Подтверждение отправки папки\n\n"
+                            f"📁 {os.path.basename(dir_path)}\n"
+                            f"Приблизительный размер: {size_str}\n\n"
+                            f"Папка будет отправлена как ZIP архив.\n"
+                            f"Подтвердите отправку:",
+                            call.message.chat.id, call.message.message_id,
+                            reply_markup=keyboard)
+                    except Exception:
+                        try:
+                            self.bot.send_message(call.message.chat.id,
+                                f"⚠️ Подтверждение отправки папки\n\n"
+                                f"📁 {os.path.basename(dir_path)}\n"
+                                f"Приблизительный размер: {size_str}\n\n"
+                                f"Папка будет отправлена как ZIP архив.\n"
+                                f"Подтвердите отправку:",
+                                reply_markup=keyboard)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logging.error(f"Ошибка в file_zip_confirm: {e}")
+                    try:
+                        self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)[:50]}")
+                    except Exception:
+                        pass
+            elif action.startswith("file_zip_"):
+                encoded = action.replace("file_zip_", "", 1)
+                dir_path = decode_path(encoded)
+                if not dir_path or not os.path.exists(dir_path) or not os.path.isdir(dir_path):
+                    try:
+                        self.bot.answer_callback_query(call.id, "❌ Папка не найдена")
+                    except Exception:
+                        pass
+                    return
+                zip_file = None
+                try:
+                    try:
+                        self.bot.answer_callback_query(call.id, "⏳ Создание архива...")
+                    except Exception:
+                        pass
+                    zip_file = get_temp_file("controlpcbot_folder_", ".zip")
+                    total_size = 0
+                    file_count = 0
+                    max_files = 10000
+                    with zipfile.ZipFile(zip_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                        for root, dirs, files in os.walk(dir_path):
+                            for file in files:
+                                try:
+                                    if file_count >= max_files:
+                                        raise Exception(f"Слишком много файлов (макс: {max_files})")
+                                    file_path = os.path.join(root, file)
+                                    if not os.path.exists(file_path) or not os.path.isfile(file_path):
+                                        continue
+                                    arcname = os.path.relpath(file_path, dir_path)
+                                    file_size = os.path.getsize(file_path)
+                                    if total_size + file_size > CONFIG["TELEGRAM_MAX_FILE_SIZE"]:
+                                        raise Exception("Размер архива превышает максимальный размер")
+                                    zipf.write(file_path, arcname)
+                                    total_size += file_size
+                                    file_count += 1
+                                except (OSError, PermissionError, UnicodeEncodeError):
+                                    continue
+                                except Exception as e:
+                                    if "превышает" in str(e) or "слишком" in str(e).lower():
+                                        raise
+                                    continue
+                    if file_count == 0:
+                        raise Exception("Папка пуста или нет доступа к файлам")
+                    zip_size = os.path.getsize(zip_file)
+                    if zip_size > CONFIG["TELEGRAM_MAX_FILE_SIZE"]:
+                        raise Exception(f"Архив слишком большой ({format_size(zip_size)}). Макс: {format_size(CONFIG['TELEGRAM_MAX_FILE_SIZE'])}")
+                    with open(zip_file, 'rb') as f:
+                        self.bot.send_document(call.message.chat.id, f,
+                                             caption=f"📦 {os.path.basename(dir_path)}.zip")
+                    try:
+                        self.bot.answer_callback_query(call.id, "✅ Папка отправлена")
+                    except Exception:
+                        pass
+                    self._log_command("Download Folder", dir_path)
+                except Exception as e:
+                    logging.error(f"Ошибка создания архива: {e}")
+                    try:
+                        self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)[:50]}")
+                    except Exception:
+                        pass
+                finally:
+                    if zip_file and os.path.exists(zip_file):
+                        try:
+                            os.remove(zip_file)
+                        except Exception:
+                            pass
+            elif action.startswith("file_dl_"):
+                encoded = action.replace("file_dl_", "", 1)
+                file_path = decode_path(encoded)
+                if not file_path:
+                    try:
+                        self.bot.answer_callback_query(call.id, "❌ Ошибка: неверный путь")
+                    except Exception:
+                        pass
+                    return
+                try:
+                    if os.path.exists(file_path) and os.path.isfile(file_path):
+                        file_size = os.path.getsize(file_path)
+                        if file_size > CONFIG["TELEGRAM_MAX_FILE_SIZE"]:
+                            try:
+                                self.bot.answer_callback_query(call.id,
+                                    f"❌ Файл слишком большой ({format_size(file_size)}). Макс: {format_size(CONFIG['TELEGRAM_MAX_FILE_SIZE'])}")
+                            except Exception:
+                                pass
+                            return
+                        try:
+                            self.bot.answer_callback_query(call.id, "⏳ Отправка файла...")
+                        except Exception:
+                            pass
+                        with open(file_path, 'rb') as f:
+                            self.bot.send_document(call.message.chat.id, f,
+                                                 caption=f"📄 {os.path.basename(file_path)}")
+                        try:
+                            self.bot.answer_callback_query(call.id, "✅ Файл отправлен")
+                        except Exception:
+                            pass
+                        self._log_command("Download File", file_path)
+                    else:
+                        try:
+                            self.bot.answer_callback_query(call.id, "❌ Файл не найден")
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logging.error(f"Ошибка отправки файла: {e}")
+                    try:
+                        self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)[:50]}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.error(f"Ошибка обработки file_action: {e}")
+            try:
+                self.bot.answer_callback_query(call.id, f"❌ Ошибка обработки: {str(e)[:50]}")
+            except Exception:
+                pass
+    
+    def _handle_process_menu(self, call):
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("📱 Просмотр активных процессов", callback_data="proc_list_apps"))
+        keyboard.add(InlineKeyboardButton("🔄 Просмотр фоновых процессов", callback_data="proc_list_bg"))
+        keyboard.add(InlineKeyboardButton("⚙️ Просмотр системных процессов", callback_data="proc_list_sys"))
+        keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu"))
+        try:
+            self.bot.edit_message_text("⚙️ Управление процессами\n\nВыберите категорию:",
+                                      call.message.chat.id, call.message.message_id,
+                                      reply_markup=keyboard)
+        except Exception:
+            try:
+                self.bot.send_message(call.message.chat.id, "⚙️ Управление процессами\n\nВыберите категорию:",
+                                     reply_markup=keyboard)
+            except Exception:
+                pass
+    
+    def _get_process_category(self, proc):
+        try:
+            proc_name = proc.name().lower()
+            system_names = [
+                'svchost.exe', 'csrss.exe', 'winlogon.exe', 'services.exe',
+                'lsass.exe', 'dwm.exe', 'smss.exe', 'System', 'Registry',
+                'conhost.exe', 'wininit.exe', 'spoolsv.exe', 'SearchIndexer.exe',
+                'taskhost.exe', 'WmiPrvSE.exe', 'audiodg.exe', 'fontdrvhost.exe',
+                'RuntimeBroker.exe', 'dllhost.exe', 'WmiApSrv.exe', 'lsm.exe',
+                'SppExtComObj.exe', 'MsMpEng.exe', 'SecurityHealthService.exe'
+            ]
+            if proc.name() in system_names or 'system' in proc_name:
+                return 'sys'
+            app_keywords = [
+                'chrome', 'firefox', 'edge', 'opera', 'brave', 'vivaldi',
+                'code', 'notepad', 'wordpad', 'mspaint', 'calc', 'explorer.exe',
+                'steam', 'discord', 'spotify', 'telegram', 'whatsapp',
+                'vlc', 'winrar', '7zfm', 'acrobat', 'photoshop', 'illustrator',
+                'excel', 'word', 'powerpoint', 'outlook', 'onenote',
+                'skype', 'zoom', 'teams', 'slack'
+            ]
+            if any(keyword in proc_name for keyword in app_keywords):
+                return 'apps'
+            try:
+                import win32gui
+                import win32process
+                def enum_window_callback(hwnd, windows):
+                    if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
+                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                        windows.add(pid)
+                    return True
+                windows = set()
+                win32gui.EnumWindows(enum_window_callback, windows)
+                if proc.pid in windows:
+                    return 'apps'
+            except Exception:
+                pass
+            return 'bg'
+        except Exception:
+            return 'bg'
+    
+    def _handle_process_list(self, call, category, page):
+        try:
+            current_time = time.time()
+            cache_key = "all"
+            if (current_time - self.process_cache_time) < self.process_cache_ttl and cache_key in self.process_cache:
+                apps, bg, sys_procs = self.process_cache[cache_key]
+            else:
+                apps = []
+                bg = []
+                sys_procs = []
+                for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
+                    try:
+                        pinfo = proc.info
+                        mem_mb = pinfo['memory_info'].rss / (1024 * 1024)
+                        proc_category = self._get_process_category(proc)
+                        if proc_category == 'apps':
+                            apps.append((pinfo['pid'], pinfo['name'], mem_mb))
+                        elif proc_category == 'sys':
+                            sys_procs.append((pinfo['pid'], pinfo['name'], mem_mb))
+                        else:
+                            bg.append((pinfo['pid'], pinfo['name'], mem_mb))
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        continue
+                self.process_cache[cache_key] = (apps, bg, sys_procs)
+                self.process_cache_time = current_time
+            if category == 'apps':
+                processes = sorted(apps, key=lambda x: x[2], reverse=True)
+                category_name = "Активные процессы"
+            elif category == 'sys':
+                processes = sorted(sys_procs, key=lambda x: x[2], reverse=True)
+                category_name = "Системные процессы"
+            else:
+                processes = sorted(bg, key=lambda x: x[2], reverse=True)
+                category_name = "Фоновые процессы"
+            total_pages = (len(processes) + CONFIG["PROCESSES_PER_PAGE"] - 1) // CONFIG["PROCESSES_PER_PAGE"]
+            if page >= total_pages:
+                page = max(0, total_pages - 1)
+            keyboard = InlineKeyboardMarkup(row_width=1)
+            start_idx = page * CONFIG["PROCESSES_PER_PAGE"]
+            end_idx = start_idx + CONFIG["PROCESSES_PER_PAGE"]
+            for pid, name, mem_mb in processes[start_idx:end_idx]:
+                callback_data = f"proc_kill_{pid}"
+                if len(callback_data) <= CONFIG["CALLBACK_DATA_MAX_LENGTH"]:
+                    keyboard.add(InlineKeyboardButton(
+                        f"❌ {name[:30]} (PID: {pid}, {mem_mb:.1f}MB)",
+                        callback_data=callback_data
+                    ))
+            nav_buttons = []
+            if page > 0:
+                nav_buttons.append(InlineKeyboardButton("◀️ Назад", callback_data=f"proc_pg_{category}_{page - 1}"))
+            if end_idx < len(processes):
+                nav_buttons.append(InlineKeyboardButton("Вперед ▶️", callback_data=f"proc_pg_{category}_{page + 1}"))
+            if nav_buttons:
+                keyboard.add(*nav_buttons)
+            keyboard.add(InlineKeyboardButton("🔙 Назад к категориям", callback_data="proc_menu"))
+            try:
+                self.bot.edit_message_text(f"❌ {category_name}\n\nВыберите процесс для завершения:",
+                                          call.message.chat.id, call.message.message_id,
+                                          reply_markup=keyboard)
+            except Exception:
+                try:
+                    self.bot.send_message(call.message.chat.id, f"❌ {category_name}\n\nВыберите процесс для завершения:",
+                                         reply_markup=keyboard)
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.error(f"Ошибка в _handle_process_list: {e}")
+            try:
+                self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)[:50]}")
+            except Exception:
+                pass
+    
+    def _handle_process_action(self, call, action):
+        try:
+            if action.startswith("proc_kill_"):
+                pid_str = action.replace("proc_kill_", "", 1)
+                try:
+                    pid = int(pid_str)
+                except ValueError:
+                    try:
+                        self.bot.answer_callback_query(call.id, "❌ Неверный ID процесса")
+                    except Exception:
+                        pass
+                    return
+                protected_pids = [0, 4]
+                if pid in protected_pids:
+                    try:
+                        self.bot.answer_callback_query(call.id, "❌ Нельзя завершить системный процесс")
+                    except Exception:
+                        pass
+                    return
+                try:
+                    proc = psutil.Process(pid)
+                    proc_name = proc.name()
+                    critical_processes = ['csrss.exe', 'winlogon.exe', 'services.exe', 'lsass.exe', 'smss.exe']
+                    if proc_name.lower() in [p.lower() for p in critical_processes]:
+                        try:
+                            self.bot.answer_callback_query(call.id, "❌ Нельзя завершить критический системный процесс")
+                        except Exception:
+                            pass
+                        return
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except psutil.TimeoutExpired:
+                        proc.kill()
+                    try:
+                        self.bot.answer_callback_query(call.id, f"✅ Процесс {proc_name} завершен")
+                    except Exception:
+                        pass
+                    self._log_command(f"Kill Process", f"PID: {pid}, Name: {proc_name}")
+                    self.process_cache.clear()
+                    self.process_cache_time = 0
+                    time.sleep(0.5)
+                    category = self.user_state.get("last_process_category", "apps")
+                    page = self.user_state.get("last_process_page", 0)
+                    self._handle_process_list(call, category, page)
+                except psutil.NoSuchProcess:
+                    try:
+                        self.bot.answer_callback_query(call.id, "❌ Процесс не найден")
+                    except Exception:
+                        pass
+                    self.process_cache.clear()
+                    self.process_cache_time = 0
+                except psutil.AccessDenied:
+                    try:
+                        self.bot.answer_callback_query(call.id, "❌ Нет прав для завершения процесса")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logging.error(f"Ошибка завершения процесса {pid}: {e}")
+                    try:
+                        self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)[:50]}")
+                    except Exception:
+                        pass
+            elif action.startswith("proc_pg_"):
+                rest = action.replace("proc_pg_", "", 1)
+                parts = rest.split("_", 1)
+                if len(parts) == 2:
+                    try:
+                        category = parts[0]
+                        page = int(parts[1])
+                        if category in ['apps', 'bg', 'sys']:
+                            self.user_state["last_process_category"] = category
+                            self.user_state["last_process_page"] = page
+                            self._handle_process_list(call, category, page)
+                        else:
+                            self._handle_process_menu(call)
+                    except (ValueError, IndexError):
+                        self._handle_process_menu(call)
+                else:
+                    self._handle_process_menu(call)
+        except Exception as e:
+            logging.error(f"Ошибка в _handle_process_action: {e}")
+            try:
+                self.bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)[:50]}")
+            except Exception:
+                pass
+    
+    def end_session(self):
+        self.stop_bot()
+        try:
+            lock_file = os.path.join(self.data_dir, '.lock')
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+        except Exception:
+            pass
+        if self.icon:
+            try:
+                self.icon.stop()
+            except Exception:
+                pass
+        sys.exit(0)
+    
+    def uninstall(self, icon=None, item=None):
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            if not messagebox.askyesno("Подтверждение", "Вы уверены, что хотите удалить программу?"):
+                root.destroy()
+                return
+            root.destroy()
+        except Exception:
+            return
+        try:
+            self.stop_bot()
+            key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+                    try:
+                        winreg.DeleteValue(key, "ControlPCbotV2")
+                    except FileNotFoundError:
+                        pass
+            except Exception:
+                pass
+            shortcuts = [
+                os.path.join(os.environ.get('APPDATA', ''),
+                           'Microsoft', 'Windows', 'Start Menu', 'Programs', 'ControlPCbotV2.lnk'),
+                os.path.join(os.environ.get('USERPROFILE', ''), 'Desktop', 'ControlPCbotV2.lnk'),
+            ]
+            for shortcut in shortcuts:
+                if os.path.exists(shortcut):
+                    try:
+                        os.remove(shortcut)
+                    except Exception:
+                        pass
+            if os.path.exists(self.data_dir):
+                try:
+                    shutil.rmtree(self.data_dir)
+                except Exception:
+                    pass
+            if os.path.exists(self.app_dir):
+                subprocess.Popen(f'ping 127.0.0.1 -n 2 >nul && rmdir /s /q "{self.app_dir}"', shell=True)
+            self._show_notification("Программа будет удалена после перезапуска")
+            if self.icon:
+                try:
+                    self.icon.stop()
+                except Exception:
+                    pass
+            sys.exit(0)
+        except Exception as e:
+            try:
+                root = tk.Tk()
+                root.withdraw()
+                messagebox.showerror("Ошибка", f"Ошибка при удалении: {str(e)}")
+                root.destroy()
+            except Exception:
+                pass
+    
+    def run_tray(self):
+        menu = pystray.Menu(
+            pystray.MenuItem("Завершить сеанс", lambda icon, item: self.end_session()),
+            pystray.MenuItem("Удалить программу", self.uninstall),
+        )
+        self.icon = pystray.Icon("ControlPCbotV2", self._create_icon(),
+                                "ControlPCbotV2", menu)
+        self.start_bot()
+        self._show_notification("ControlPCbotV2 запущен")
+        self.icon.run()
 
+def check_running_instance():
+    try:
+        if not is_frozen():
+            return False
+        data_dir = get_data_dir()
+        lock_file = os.path.join(data_dir, '.lock')
+        if os.path.exists(lock_file):
+            try:
+                with open(lock_file, 'r') as f:
+                    old_pid = int(f.read().strip())
+                if old_pid == os.getpid():
+                    return False
+                try:
+                    os.kill(old_pid, 0)
+                    return True
+                except (OSError, ProcessLookupError):
+                    os.remove(lock_file)
+            except Exception:
+                try:
+                    os.remove(lock_file)
+                except Exception:
+                    pass
+        try:
+            with open(lock_file, 'w') as f:
+                f.write(str(os.getpid()))
+        except Exception:
+            pass
+        return False
+    except Exception:
+        return False
+
+def main():
+    try:
+        if not is_frozen():
+            print("Программа должна быть скомпилирована в exe файл!")
+            sys.exit(1)
+        app_dir = get_app_dir()
+        config_path = os.path.join(app_dir, 'config.json')
+        if not os.path.exists(config_path):
+            run_installer()
+            return
+        time.sleep(0.5)
+        is_duplicate = check_running_instance()
+        if is_duplicate:
+            try:
+                toaster = ToastNotifier()
+                toaster.show_toast("ControlPCbotV2",
+                                 "Программа уже запущена, используйте трей для взаимодействия",
+                                 duration=5, threaded=True)
+            except Exception:
+                pass
+            try:
+                root = tk.Tk()
+                root.withdraw()
+                messagebox.showwarning("Программа уже запущена",
+                                      "Используйте системный трей для взаимодействия!")
+                root.destroy()
+            except Exception:
+                pass
+            return
+        app = BotApp()
+        def cleanup():
+            try:
+                lock_file = os.path.join(app.data_dir, '.lock')
+                if os.path.exists(lock_file):
+                    with open(lock_file, 'r') as f:
+                        if f.read().strip() == str(os.getpid()):
+                            os.remove(lock_file)
+            except Exception:
+                pass
+        atexit.register(cleanup)
+        app.run_tray()
+    except KeyboardInterrupt:
+        try:
+            if 'app' in locals():
+                app.stop_bot()
+        except Exception:
+            pass
+    except Exception as e:
+        error_msg = str(e)
+        traceback_str = traceback.format_exc()
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("Ошибка", f"Критическая ошибка:\n{error_msg}")
+            root.destroy()
+        except Exception:
+            try:
+                data_dir = get_data_dir()
+                error_log = os.path.join(data_dir, 'error.log')
+                with open(error_log, 'w', encoding='utf-8') as f:
+                    f.write(traceback_str)
+            except Exception:
+                print(f"Критическая ошибка: {error_msg}")
+                print(traceback_str)
 
 if __name__ == "__main__":
-    if not os.path.exists("command_log.txt"):
-        open("command_log.txt", 'w').close()
-
-    if check_system_uptime():
-        try:
-            bot.send_message(config.CHAT_ID,
-                             "🖥️ Компьютер был запущен! ControlPCbotV2 активен\nАвтор: https://github.com/MrachniyTipchek")
-        except Exception as e:
-            print(f"Не удалось отправить уведомление о запуске: {str(e)}")
-
-    print("=" * 50)
-    print("ControlPCbotV2 - Windows Telegram Control Bot")
-    print("=" * 50)
-    print(f"Токен: {config.TOKEN}")
-    print(f"Chat ID: {config.CHAT_ID}")
-    print("Автор: https://github.com/MrachniyTipchek")
-    print("\nБот запущен. Ожидание сообщений...")
-    print("Для остановки нажмите Ctrl+C")
-
-    try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=30)
-    except Exception as e:
-        print(f"\nОшибка: {str(e)}")
-        print("Перезапустите бот")
+    main()
