@@ -150,16 +150,12 @@ class InstallerWindow:
         self.root.configure(bg="#1a1a1a")
         self.root.resizable(False, False)
         
-        # Установка иконки
         icon_path = os.path.join(get_app_dir(), 'icon.ico')
         if os.path.exists(icon_path):
             try:
                 self.root.iconbitmap(icon_path)
             except Exception:
                 pass
-        
-        # Убираем стандартный заголовок Windows
-        self.root.overrideredirect(True)
         
         self.root.update_idletasks()
         x = (self.root.winfo_screenwidth() // 2) - (self.root.winfo_width() // 2)
@@ -169,48 +165,11 @@ class InstallerWindow:
         self._setup_ui()
     
     def _setup_ui(self):
-        title_frame = tk.Frame(self.root, bg="#2d2d2d", height=40)
-        title_frame.pack(fill=tk.X)
-        title_frame.pack_propagate(False)
-        
-        # Добавляем возможность перетаскивания окна за title bar
-        title_frame.bind("<Button-1>", self._start_drag)
-        title_frame.bind("<B1-Motion>", self._on_drag)
-        
-        title_lbl = tk.Label(title_frame, text="ControlPCbotV2 - Установка",
-                           bg="#2d2d2d", fg="white", font=("Segoe UI", 11))
-        title_lbl.pack(side=tk.LEFT, padx=8, pady=10)
-        
-        # Добавляем перетаскивание и для label
-        title_lbl.bind("<Button-1>", self._start_drag)
-        title_lbl.bind("<B1-Motion>", self._on_drag)
-        
-        close_btn = tk.Button(title_frame, text="✕", command=self._on_close,
-                            bg="#2d2d2d", fg="white", font=("Segoe UI", 14),
-                            relief=tk.FLAT, width=3, height=1,
-                            activebackground="#e81123", cursor="hand2", borderwidth=0)
-        close_btn.pack(side=tk.RIGHT, padx=0, pady=0)
-        close_btn.bind("<Enter>", lambda e: close_btn.config(bg="#e81123"))
-        close_btn.bind("<Leave>", lambda e: close_btn.config(bg="#2d2d2d"))
         content = tk.Frame(self.root, bg="#1a1a1a")
         content.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
         default_path = os.path.join(os.environ.get('ProgramFiles', 'C:\\Program Files'), 'ControlPCbotV2')
         self.add_start = tk.BooleanVar(value=True)
         self.add_desktop = tk.BooleanVar(value=True)
-        
-        def on_paste(event):
-            try:
-                text = self.root.clipboard_get()
-                if text:
-                    widget = event.widget
-                    try:
-                        widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
-                    except:
-                        pass
-                    widget.insert(tk.INSERT, text)
-            except Exception:
-                pass
-            return "break"
         
         tk.Label(content, text="Telegram Bot Token:", bg="#1a1a1a",
                 fg="#e0e0e0", font=("Segoe UI", 10)).grid(row=0, column=0, sticky=tk.W, padx=25, pady=(25, 5))
@@ -218,10 +177,8 @@ class InstallerWindow:
                                    insertbackground="white", font=("Segoe UI", 9),
                                    relief=tk.FLAT, borderwidth=1,
                                    highlightthickness=1, highlightbackground="#3c3c3c",
-                                   highlightcolor="#0078d4")
+                                   highlightcolor="#0078d4", exportselection=0)
         self.entry_token.grid(row=1, column=0, padx=25, pady=(0, 15), sticky=tk.EW)
-        self.entry_token.bind("<Control-v>", on_paste)
-        self.entry_token.bind("<Shift-Insert>", on_paste)
         
         tk.Label(content, text="Chat ID:", bg="#1a1a1a",
                 fg="#e0e0e0", font=("Segoe UI", 10)).grid(row=2, column=0, sticky=tk.W, padx=25, pady=(0, 5))
@@ -229,10 +186,8 @@ class InstallerWindow:
                                   insertbackground="white", font=("Segoe UI", 9),
                                   relief=tk.FLAT, borderwidth=1,
                                   highlightthickness=1, highlightbackground="#3c3c3c",
-                                  highlightcolor="#0078d4")
+                                  highlightcolor="#0078d4", exportselection=0)
         self.entry_chat.grid(row=3, column=0, padx=25, pady=(0, 15), sticky=tk.EW)
-        self.entry_chat.bind("<Control-v>", on_paste)
-        self.entry_chat.bind("<Shift-Insert>", on_paste)
         
         tk.Label(content, text="Путь установки:", bg="#1a1a1a",
                 fg="#e0e0e0", font=("Segoe UI", 10)).grid(row=4, column=0, sticky=tk.W, padx=25, pady=(0, 5))
@@ -242,11 +197,9 @@ class InstallerWindow:
                                    insertbackground="white", font=("Segoe UI", 9),
                                    relief=tk.FLAT, borderwidth=1,
                                    highlightthickness=1, highlightbackground="#3c3c3c",
-                                   highlightcolor="#0078d4")
+                                   highlightcolor="#0078d4", exportselection=0)
         self.entry_path.insert(0, default_path)
         self.entry_path.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.entry_path.bind("<Control-v>", on_paste)
-        self.entry_path.bind("<Shift-Insert>", on_paste)
         tk.Button(path_frame, text="Обзор...", command=self._browse,
                  bg="#0078d4", fg="white", font=("Segoe UI", 9),
                  relief=tk.FLAT, width=10, cursor="hand2",
@@ -276,15 +229,6 @@ class InstallerWindow:
         content.columnconfigure(0, weight=1)
         path_frame.columnconfigure(0, weight=1)
     
-    def _start_drag(self, event):
-        self._drag_data["x"] = event.x
-        self._drag_data["y"] = event.y
-    
-    def _on_drag(self, event):
-        x = self.root.winfo_x() + (event.x - self._drag_data["x"])
-        y = self.root.winfo_y() + (event.y - self._drag_data["y"])
-        self.root.geometry(f"+{x}+{y}")
-    
     def _browse(self):
         folder = filedialog.askdirectory(title="Выберите папку для установки")
         if folder:
@@ -313,6 +257,9 @@ class InstallerWindow:
         if self.root:
             try:
                 self.root.quit()
+            except Exception:
+                pass
+            try:
                 self.root.destroy()
             except Exception:
                 pass
@@ -321,7 +268,10 @@ class InstallerWindow:
     def show(self):
         if not self.root:
             self._create_window()
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        except Exception:
+            pass
         return self.result
 
 def run_installer():
@@ -531,7 +481,15 @@ class BotApp:
         for icon_path in icon_paths:
             if os.path.exists(icon_path):
                 try:
-                    return Image.open(icon_path)
+                    ico_image = Image.open(icon_path)
+                    current_size = max(ico_image.size[0], ico_image.size[1])
+                    if current_size > 64:
+                        ico_image = ico_image.resize((64, 64), Image.Resampling.LANCZOS)
+                    elif current_size < 32:
+                        ico_image = ico_image.resize((32, 32), Image.Resampling.LANCZOS)
+                    if ico_image.mode != 'RGBA':
+                        ico_image = ico_image.convert('RGBA')
+                    return ico_image
                 except Exception as e:
                     logging.error(f"Ошибка загрузки иконки из {icon_path}: {e}")
                     continue
