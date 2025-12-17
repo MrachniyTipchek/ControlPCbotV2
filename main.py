@@ -196,7 +196,9 @@ class InstallerWindow:
         self.root.geometry(f"+{x}+{y}")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._setup_ui()
-        self.root.after(100, self._fix_admin_clipboard)
+        
+        if is_admin():
+            self.root.after(100, self._fix_admin_clipboard)
     
     def _fix_admin_clipboard(self):
         try:
@@ -204,26 +206,9 @@ class InstallerWindow:
             hwnd = self.root.winfo_id()
             
             MSGFLT_ALLOW = 1
-            messages = [
-                0x0049,
-                0x004A,
-                0x0233,
-                0x0031,
-                0x0302,
-                0x0303,
-                0x0304,
-                0x0305,
-                0x0306,
-                0x0307,
-                0x0308,
-                0x0309,
-                0x030A,
-                0x030B,
-                0x030C,
-                0x030D,
-                0x030E,
-                0x030F,
-            ]
+            messages = [0x0049, 0x004A, 0x0233, 0x0031, 0x0302, 0x0303, 0x0304, 0x0305, 
+                       0x0306, 0x0307, 0x0308, 0x0309, 0x030A, 0x030B, 0x030C, 0x030D, 
+                       0x030E, 0x030F]
             
             for msg in messages:
                 try:
@@ -236,7 +221,6 @@ class InstallerWindow:
                 ChangeWindowMessageFilterEx.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p]
                 ChangeWindowMessageFilterEx.restype = ctypes.c_bool
                 
-                MSGFLT_ALLOW = 1
                 for msg in messages:
                     try:
                         ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, None)
@@ -260,7 +244,7 @@ class InstallerWindow:
     def _setup_ui(self):
         content = tk.Frame(self.root, bg="#1a1a1a")
         content.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
-        default_path = os.path.join(os.environ.get('ProgramFiles', 'C:\\Program Files'), 'ControlPCbotV2')
+        default_path = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'ControlPCbotV2')
         self.add_start = tk.BooleanVar(value=True)
         self.add_desktop = tk.BooleanVar(value=True)
         
@@ -435,6 +419,18 @@ def run_installer():
         root.destroy()
         return
     
+    if is_admin():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showwarning("Запуск от администратора",
+            "⚠️ Установщик запущен от имени администратора.\n\n"
+            "Это может вызвать проблемы:\n"
+            "• Невозможность использовать некоторые горячие клавиши\n"
+            "• Ограничения при вводе текста\n\n"
+            "Рекомендуется запускать установщик БЕЗ прав администратора.\n"
+            "Установка будет выполнена в домашнюю папку пользователя.")
+        root.destroy()
+    
     installer = InstallerWindow()
     result = installer.show()
     if not result:
@@ -449,14 +445,26 @@ def run_installer():
     if needs_admin_for_install(install_path) and not is_admin():
         root = tk.Tk()
         root.withdraw()
-        if messagebox.askyesno("Требуются права администратора",
-                              "Для установки в Program Files требуются права администратора.\n"
-                              "Перезапустить установщик от имени администратора?"):
+        choice = messagebox.askyesnocancel(
+            "Требуются права администратора",
+            "Для установки в Program Files требуются права администратора.\n\n"
+            "ДА - Перезапустить от имени администратора\n"
+            "НЕТ - Установить в домашнюю папку (рекомендуется)\n"
+            "ОТМЕНА - Вернуться к настройкам"
+        )
+        
+        if choice is None:
+            root.destroy()
+            return run_installer()
+        elif choice:
             root.destroy()
             if run_as_admin():
                 sys.exit(0)
-        root.destroy()
-        return
+            return
+        else:
+            root.destroy()
+            result["path"] = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'ControlPCbotV2')
+            install_path = result["path"]
     
     if os.path.exists(install_path):
         root = tk.Tk()
@@ -504,10 +512,54 @@ def run_installer():
             root.destroy()
             time.sleep(CONFIG["SHUTDOWN_WAIT"])
             try:
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = subprocess.SW_HIDE
-                subprocess.Popen([main_exe], cwd=install_path, shell=False, startupinfo=startupinfo)
+                if is_admin():
+                    try:
+                        import win32api
+                        import win32con
+                        import win32process
+                        import win32security
+                        
+                        hwnd = ctypes.windll.user32.GetShellWindow()
+                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                        process = win32api.OpenProcess(win32con.PROCESS_QUERY_INFORMATION, False, pid)
+                        token = win32security.OpenProcessToken(process, win32con.TOKEN_DUPLICATE)
+                        
+                        primary_token = win32security.DuplicateTokenEx(
+                            token,
+                            win32security.SecurityImpersonation,
+                            win32con.TOKEN_QUERY | win32con.TOKEN_ASSIGN_PRIMARY | win32con.TOKEN_DUPLICATE | 
+                            win32con.TOKEN_ADJUST_DEFAULT | win32con.TOKEN_ADJUST_SESSIONID,
+                            win32security.TokenPrimary,
+                            None
+                        )
+                        
+                        startupinfo = subprocess.STARTUPINFO()
+                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        startupinfo.wShowWindow = subprocess.SW_HIDE
+                        
+                        import win32process
+                        win32process.CreateProcessAsUser(
+                            primary_token,
+                            main_exe,
+                            None,
+                            None,
+                            None,
+                            False,
+                            0,
+                            None,
+                            install_path,
+                            startupinfo
+                        )
+                    except Exception:
+                        startupinfo = subprocess.STARTUPINFO()
+                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        startupinfo.wShowWindow = subprocess.SW_HIDE
+                        subprocess.Popen([main_exe], cwd=install_path, shell=False, startupinfo=startupinfo)
+                else:
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = subprocess.SW_HIDE
+                    subprocess.Popen([main_exe], cwd=install_path, shell=False, startupinfo=startupinfo)
             except Exception:
                 pass
         else:
