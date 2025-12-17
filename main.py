@@ -196,6 +196,56 @@ class InstallerWindow:
         self.root.geometry(f"+{x}+{y}")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._setup_ui()
+        self.root.after(100, self._fix_admin_clipboard)
+    
+    def _fix_admin_clipboard(self):
+        try:
+            self.root.update()
+            hwnd = self.root.winfo_id()
+            
+            MSGFLT_ALLOW = 1
+            messages = [
+                0x0049,
+                0x004A,
+                0x0233,
+                0x0031,
+                0x0302,
+                0x0303,
+                0x0304,
+                0x0305,
+                0x0306,
+                0x0307,
+                0x0308,
+                0x0309,
+                0x030A,
+                0x030B,
+                0x030C,
+                0x030D,
+                0x030E,
+                0x030F,
+            ]
+            
+            for msg in messages:
+                try:
+                    ctypes.windll.user32.ChangeWindowMessageFilter(msg, MSGFLT_ALLOW)
+                except Exception:
+                    pass
+            
+            try:
+                ChangeWindowMessageFilterEx = ctypes.windll.user32.ChangeWindowMessageFilterEx
+                ChangeWindowMessageFilterEx.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p]
+                ChangeWindowMessageFilterEx.restype = ctypes.c_bool
+                
+                MSGFLT_ALLOW = 1
+                for msg in messages:
+                    try:
+                        ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, None)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
     
     def _enable_clipboard(self, entry):
         entry.bind('<Control-v>', lambda e: entry.event_generate('<<Paste>>'))
@@ -486,6 +536,7 @@ class BotApp:
         self.visible_windows_cache_time = 0
         self.token = ""
         self.chat_id = 0
+        self.notifications_enabled = False
         self._is_frozen = is_frozen()
         self._setup_logging()
         self._load_config()
@@ -533,9 +584,10 @@ class BotApp:
         except (OSError, IOError) as e:
             logging.error(f"Ошибка записи в лог: {e}")
     
-    def _show_notification(self, message):
+    def _show_notification(self, message, force=False):
         try:
-            ToastNotifier().show_toast("ControlPCbotV2", message, duration=CONFIG["TOAST_DURATION"], threaded=True)
+            if force or self.notifications_enabled:
+                ToastNotifier().show_toast("ControlPCbotV2", message, duration=CONFIG["TOAST_DURATION"], threaded=True)
         except Exception:
             pass
     
@@ -585,7 +637,7 @@ class BotApp:
     
     def start_bot(self):
         if not self.token or not self.chat_id:
-            self._show_notification("Ошибка: Не настроены токен или Chat ID")
+            self._show_notification("Ошибка: Не настроены токен или Chat ID", force=True)
             return
         if self.running:
             return
@@ -593,10 +645,10 @@ class BotApp:
         try:
             self.bot_thread = threading.Thread(target=self._run_bot, daemon=True)
             self.bot_thread.start()
-            self._show_notification("Бот запущен")
+            self._show_notification("Бот запущен", force=True)
         except Exception as e:
             self.running = False
-            self._show_notification(f"Ошибка запуска: {str(e)[:50]}")
+            self._show_notification(f"Ошибка запуска: {str(e)[:50]}", force=True)
             logging.error(f"Ошибка запуска бота: {e}")
     
     def stop_bot(self):
@@ -610,7 +662,7 @@ class BotApp:
                 pass
         if self.bot_thread:
             self.bot_thread.join(timeout=CONFIG["BOT_STOP_TIMEOUT"])
-        self._show_notification("Бот остановлен")
+        self._show_notification("Бот остановлен", force=True)
     
     def _clear_process_cache(self):
         self.process_cache.clear()
@@ -676,7 +728,7 @@ class BotApp:
                     error_str = str(e)
                     if "Unauthorized" in error_str or "invalid token" in error_str.lower():
                         logging.error("Неверный токен бота")
-                        self._show_notification("Ошибка: Неверный токен бота")
+                        self._show_notification("Ошибка: Неверный токен бота", force=True)
                         self.running = False
                         break
                     elif "Conflict" in error_str:
@@ -692,7 +744,7 @@ class BotApp:
         except Exception as e:
             logging.error(f"Критическая ошибка в _run_bot: {e}")
             self.running = False
-            self._show_notification(f"Ошибка запуска: {str(e)[:50]}")
+            self._show_notification(f"Ошибка запуска: {str(e)[:50]}", force=True)
     
     def _setup_bot_handlers(self):
         @self.bot.message_handler(func=lambda m: m.chat.id != self.chat_id)
@@ -852,6 +904,7 @@ class BotApp:
                     output = "Команда выполнена успешно" if result.returncode == 0 else "Команда завершилась с ошибкой"
                 
                 self._log_command(command, output)
+                self._show_notification(f"Выполнена команда: {command[:40]}")
                 
                 if len(output) > CONFIG["MESSAGE_MAX_LENGTH"]:
                     temp_file = get_temp_file("controlpcbot_output_", ".txt")
@@ -961,6 +1014,7 @@ class BotApp:
             with open(temp_file, 'rb') as photo:
                 self.bot.send_photo(call.message.chat.id, photo, caption="📸 Скриншот выполнен успешно")
             self._log_command("Screenshot", "Taken")
+            self._show_notification("Выполнен скриншот экрана")
         except (OSError, IOError, pyautogui.FailSafeException) as e:
             logging.error(f"Ошибка создания скриншота: {e}")
             safe_answer_callback(self.bot, call.id, f"❌ Ошибка: {str(e)[:50]}")
@@ -982,6 +1036,7 @@ class BotApp:
                            "✅ Компьютер будет выключен через 1 минуту!")
             self._log_command("System Shutdown", "Initiated")
             subprocess.run(['shutdown', '/s', '/t', str(CONFIG["SHUTDOWN_DELAY"])], check=False, timeout=5)
+            self._show_notification("Запущено выключение компьютера")
         except (OSError, subprocess.SubprocessError) as e:
             logging.error(f"Ошибка выключения компьютера: {e}")
             try:
@@ -1004,6 +1059,7 @@ class BotApp:
                            "✅ Компьютер будет перезагружен через 1 минуту!")
             self._log_command("System Reboot", "Initiated")
             subprocess.run(['shutdown', '/r', '/t', str(CONFIG["SHUTDOWN_DELAY"])], check=False, timeout=5)
+            self._show_notification("Запущена перезагрузка компьютера")
         except (OSError, subprocess.SubprocessError) as e:
             logging.error(f"Ошибка перезагрузки компьютера: {e}")
             safe_answer_callback(self.bot, call.id, f"❌ Ошибка: {str(e)}")
@@ -1013,6 +1069,7 @@ class BotApp:
             ctypes.windll.user32.LockWorkStation()
             self.bot.send_message(call.message.chat.id, "🔒 Экран заблокирован")
             self._log_command("Lock Screen", "Screen locked")
+            self._show_notification("Экран заблокирован")
         except (OSError, ctypes.WinError):
             pass
     
@@ -1025,22 +1082,23 @@ class BotApp:
         safe_edit_or_send(self.bot, call.message.chat.id, call.message.message_id,
                          "🔊 Управление громкостью - выберите действие:", reply_markup=keyboard)
     
-    def _handle_volume_action(self, call, key, message, log_action):
+    def _handle_volume_action(self, call, key, message, log_action, notification):
         try:
             pyautogui.press(key)
             safe_answer_callback(self.bot, call.id, message)
             self._log_command("Volume Control", log_action)
+            self._show_notification(notification)
         except (pyautogui.FailSafeException, OSError) as e:
             safe_answer_callback(self.bot, call.id, f"❌ Ошибка: {str(e)}")
     
     def _handle_volume_mute(self, call):
-        self._handle_volume_action(call, 'volumemute', "🔇 Звук отключен", "Mute")
+        self._handle_volume_action(call, 'volumemute', "🔇 Звук отключен", "Mute", "Звук отключен")
     
     def _handle_volume_up(self, call):
-        self._handle_volume_action(call, 'volumeup', "🔊 Громкость увеличена", "Volume Up")
+        self._handle_volume_action(call, 'volumeup', "🔊 Громкость увеличена", "Volume Up", "Громкость увеличена")
     
     def _handle_volume_down(self, call):
-        self._handle_volume_action(call, 'volumedown', "🔈 Громкость уменьшена", "Volume Down")
+        self._handle_volume_action(call, 'volumedown', "🔈 Громкость уменьшена", "Volume Down", "Громкость уменьшена")
     
     def _handle_download_file(self, message, file_path):
         try:
@@ -1094,6 +1152,7 @@ class BotApp:
                 return
             
             self.user_state[f"dir_path_{message.chat.id}"] = abs_path
+            self._show_notification(f"Просмотр директории: {os.path.basename(abs_path) or abs_path}")
             self._show_dir_page(message.chat.id, abs_path, 0)
         except (OSError, ValueError, PermissionError) as e:
             logging.error(f"Ошибка в _handle_dir_command: {e}")
@@ -1228,6 +1287,7 @@ class BotApp:
             
             safe_answer_callback(self.bot, call.id, "✅ Файл отправлен")
             self._log_command("Download File", file_path)
+            self._show_notification(f"Отправлен файл: {os.path.basename(file_path)}")
         except (OSError, PermissionError):
             safe_answer_callback(self.bot, call.id, "❌ Ошибка доступа к файлу")
         except telebot.apihelper.ApiTelegramException as e:
@@ -1295,6 +1355,7 @@ class BotApp:
                     safe_answer_callback(self.bot, call.id, "✅ Файл загружен")
                     self.bot.send_message(call.message.chat.id, f"✅ Файл успешно загружен:\n📄 {result}")
                     self._log_command("Upload File", result)
+                    self._show_notification(f"Загружен файл: {file_name}")
                 else:
                     safe_answer_callback(self.bot, call.id, result)
             except (telebot.apihelper.ApiTelegramException, OSError, IOError) as e:
@@ -1445,6 +1506,7 @@ class BotApp:
                         proc.kill()
                     safe_answer_callback(self.bot, call.id, f"✅ Процесс {proc_name} завершен")
                     self._log_command("Kill Process", f"PID: {pid}, Name: {proc_name}")
+                    self._show_notification(f"Завершен процесс: {proc_name}")
                     self._clear_process_cache()
                     time.sleep(CONFIG["PROCESS_REFRESH_WAIT"])
                     self._handle_process_list(call, self.user_state.get("last_process_category", "apps"),
@@ -1535,7 +1597,7 @@ class BotApp:
             
             subprocess.Popen(f'ping 127.0.0.1 -n 2 >nul && rmdir /s /q "{self.app_dir}"', shell=True)
             
-            self._show_notification("Программа будет удалена после перезапуска")
+            self._show_notification("Программа будет удалена после перезапуска", force=True)
             if self.icon:
                 try:
                     self.icon.stop()
@@ -1552,15 +1614,38 @@ class BotApp:
             except Exception:
                 pass
     
+    def _toggle_notifications_on(self, icon=None, item=None):
+        self.notifications_enabled = True
+        self._show_notification("Уведомления включены", force=True)
+        if self.icon:
+            self.icon.menu = self._create_tray_menu()
+    
+    def _toggle_notifications_off(self, icon=None, item=None):
+        self.notifications_enabled = False
+        self._show_notification("Уведомления отключены", force=True)
+        if self.icon:
+            self.icon.menu = self._create_tray_menu()
+    
+    def _create_tray_menu(self):
+        if self.notifications_enabled:
+            return pystray.Menu(
+                pystray.MenuItem("Отключить уведомления", self._toggle_notifications_off),
+                pystray.MenuItem("Завершить сеанс", lambda icon, item: self.end_session()),
+                pystray.MenuItem("Удалить программу", self.uninstall),
+            )
+        else:
+            return pystray.Menu(
+                pystray.MenuItem("Включить уведомления", self._toggle_notifications_on),
+                pystray.MenuItem("Завершить сеанс", lambda icon, item: self.end_session()),
+                pystray.MenuItem("Удалить программу", self.uninstall),
+            )
+    
     def run_tray(self):
         """Запуск приложения в системном трее"""
-        menu = pystray.Menu(
-            pystray.MenuItem("Завершить сеанс", lambda icon, item: self.end_session()),
-            pystray.MenuItem("Удалить программу", self.uninstall),
-        )
+        menu = self._create_tray_menu()
         self.icon = pystray.Icon("ControlPCbotV2", self._create_icon(), "ControlPCbotV2", menu)
         self.start_bot()
-        self._show_notification("ControlPCbotV2 запущен")
+        self._show_notification("ControlPCbotV2 запущен", force=True)
         self.icon.run()
 
 def check_running_instance():
@@ -1604,16 +1689,9 @@ def main():
         if check_running_instance():
             try:
                 ToastNotifier().show_toast("ControlPCbotV2",
-                                         "Программа уже запущена, используйте трей для взаимодействия",
-                                         duration=5, threaded=True)
-            except Exception:
-                pass
-            try:
-                root = tk.Tk()
-                root.withdraw()
-                messagebox.showwarning("Программа уже запущена",
-                                      "Используйте системный трей для взаимодействия!")
-                root.destroy()
+                                         "Программа ControlPCbot уже запущена, используйте трей для взаимодействия",
+                                         duration=5, threaded=False)
+                time.sleep(5)
             except Exception:
                 pass
             return
